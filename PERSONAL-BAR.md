@@ -38,7 +38,7 @@ Resolve `helper/bar.swift` by retaining the Calendar/CodexBar sections and both 
 
 ## Limitations
 
-- Running `~/.local/share/omacosy/install.sh` directly bypasses the wrapper and starts the plain upstream bar. Run `./personal-bar/activate` afterward.
+- Running `~/.local/share/omacosy/install.sh` directly bypasses the wrapper and can start a second, plain upstream bar. Run `./personal-bar/activate` afterward to unload and archive it.
 - If an update is forcibly interrupted after upstream starts its bar but before reactivation, run `./personal-bar/activate`.
 - Upstream's `omacosy-toggle` knows only `com.omacosy.bar`, not `com.omacosy.personal-bar`; use `launchctl bootout gui/$(id -u)/com.omacosy.personal-bar` when you specifically want this bar stopped.
 - Visual Calendar content depends on macOS Calendar permission. The bar hides the pill when access or data is unavailable.

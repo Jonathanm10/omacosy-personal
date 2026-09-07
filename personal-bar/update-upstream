@@ -2,7 +2,15 @@
 # Update the clean upstream checkout, then reclaim the personal bar.
 set -uo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *) SELF="$(dirname "$SELF")/$LINK" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$SELF")/.." && pwd)"
 UPSTREAM_REPO="${OMACOSY_UPSTREAM_REPO:-$HOME/.local/share/omacosy}"
 UPDATER="$UPSTREAM_REPO/bin/omacosy-update"
 ACTIVATE="$REPO/personal-bar/activate"

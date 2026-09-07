@@ -30,6 +30,7 @@ import CoreAudio
 import CoreBluetooth
 import CoreLocation
 import CoreWLAN
+import EventKit
 import IOBluetooth
 import IOKit.ps
 import SystemConfiguration
@@ -103,10 +104,12 @@ func aerospace(_ args: [String]) -> String {
 // AeroSpace to OmniWM (and back) while this daemon runs, so which one is
 // asked is decided per use, never cached: the running-app check is an
 // in-process lookup, cheap enough to be the whole detection.
-let omniwmBundleID = "com.barut.OmniWM"
+let omniwmBundleIDs = ["com.barut.OmniWM", "com.jonathan.OmniWMPatched"]
 
 func omniwmActive() -> Bool {
-    !NSRunningApplication.runningApplications(withBundleIdentifier: omniwmBundleID).isEmpty
+    omniwmBundleIDs.contains {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: $0).isEmpty
+    }
 }
 
 let omniwmctlBin = ["/opt/homebrew/bin/omniwmctl",
@@ -595,12 +598,14 @@ func spotify(_ command: String) {
 struct BarItem: Equatable {
     var icon = ""
     var label = ""
+    var compactLabel: String?
     var iconColor: NSColor?
+    var labelColor: NSColor?
     var drawing = true
 }
 
 // screen order, left to right
-let rightOrder = ["weather", "wifi", "bluetooth", "brightness", "volume", "battery", "clock", "activity"]
+let rightOrder = ["codex", "meeting", "weather", "wifi", "bluetooth", "brightness", "volume", "battery", "clock", "activity"]
 var rightItems: [String: BarItem] = [:]
 
 func set(_ name: String, _ mutate: (inout BarItem) -> Void) {
@@ -629,11 +634,474 @@ func shell(_ launch: String, _ args: [String]) -> String {
     return String(data: out, encoding: .utf8) ?? ""
 }
 
+// --- meetings (EventKit publishes database and permission changes) --------
+// EventKit objects become invalid when the store changes. Only these value
+// snapshots cross from the calendar queue to the main-thread UI.
+struct MeetingEvent: Equatable {
+    let title: String
+    let startDate: Date
+    let endDate: Date
+    let meetingURL: URL?
+    let calendarURL: URL
+}
+
+private struct MeetingURLCandidate {
+    let url: URL
+    let sourcePriority: Int
+}
+
+final class MeetingController {
+    private let eventStore = EKEventStore()
+    private let queue = DispatchQueue(label: "com.omacosy.bar.calendar", qos: .utility)
+    private let linkDetector = try? NSDataDetector(
+        types: NSTextCheckingResult.CheckingType.link.rawValue)
+    private var observer: NSObjectProtocol?
+    private var events: [MeetingEvent] = [] // main thread only
+    private var agendaLoaded = false // distinguishes an empty day from unavailable access
+    private var displayedEvent: MeetingEvent? // exact event represented by the pill
+    private var started = false
+    private var refreshDay: Date?
+    private var reloadGeneration = 0
+
+    func start() {
+        guard !started else { return }
+        started = true
+        refreshDay = Calendar.current.startOfDay(for: Date())
+        observer = NotificationCenter.default.addObserver(
+            forName: .EKEventStoreChanged, object: eventStore, queue: .main
+        ) { [weak self] _ in self?.reload() }
+
+        switch EKEventStore.authorizationStatus(for: .event) {
+        case .fullAccess:
+            reload()
+        case .notDetermined:
+            eventStore.requestFullAccessToEvents { [weak self] granted, error in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if granted {
+                        self.reload()
+                    } else {
+                        if let error { tlog("calendar permission: \(error.localizedDescription)") }
+                        self.publish([], loaded: false)
+                    }
+                }
+            }
+        case .denied, .restricted, .writeOnly:
+            publish([], loaded: false)
+        @unknown default:
+            publish([], loaded: false)
+        }
+    }
+
+    // The existing minute boundary drives countdowns. One daily re-fetch
+    // moves the finite look-ahead window without adding another timer.
+    func minuteTick() {
+        guard started else { return }
+        updateItem()
+        let today = Calendar.current.startOfDay(for: Date())
+        if today != refreshDay {
+            refreshDay = today
+            reload()
+        }
+    }
+
+    func openCurrent() {
+        guard let displayedEvent else { return }
+        open(displayedEvent)
+    }
+
+    func popupRows() -> [PopupRow] {
+        let now = Date()
+        let upcoming = remainingEvents(at: now).prefix(5)
+        guard !upcoming.isEmpty else {
+            return agendaLoaded
+                ? [PopupRow(icon: "󰄬", text: "no more events today", hero: true)]
+                : []
+        }
+        var rows = [PopupRow(text: "today", hero: true)]
+        let current = currentEvent(at: now)
+        let time = DateFormatter()
+        time.dateFormat = "HH:mm"
+        for event in upcoming {
+            let when = event.startDate <= now ? "now" : time.string(from: event.startDate).lowercased()
+            rows.append(PopupRow(
+                icon: event.meetingURL == nil ? "󰃰" : "󰤙",
+                text: "\(when)  \(event.title)",
+                highlight: event == current,
+                action: { [weak self] in self?.open(event) }
+            ))
+        }
+        return rows
+    }
+
+    private func reload() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        reloadGeneration += 1
+        let generation = reloadGeneration
+        guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else {
+            publish([], generation: generation, loaded: false)
+            return
+        }
+        queue.async { [weak self] in
+            guard let self else { return }
+            let now = Date()
+            let calendar = Calendar.current
+            let dayStart = calendar.startOfDay(for: now)
+            guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) else {
+                self.publish([], generation: generation, loaded: true)
+                return
+            }
+            // Subscribed read-only calendars are usually holidays or feeds.
+            // The default includes calendars whose events the user can edit.
+            let calendars = self.eventStore.calendars(for: .event)
+                .filter(\.allowsContentModifications)
+            guard !calendars.isEmpty else {
+                self.publish([], generation: generation, loaded: true)
+                return
+            }
+            let predicate = self.eventStore.predicateForEvents(
+                withStart: dayStart, end: dayEnd, calendars: calendars)
+            let eligible = self.eventStore.events(matching: predicate).filter { event in
+                if event.startDate >= dayEnd || event.endDate <= now
+                    || event.isAllDay || event.status == .canceled {
+                    return false
+                }
+                return !(event.attendees?.contains {
+                    $0.isCurrentUser && $0.participantStatus == .declined
+                } ?? false)
+            }
+            let mapped = eligible.map { self.snapshot($0) }
+            let snapshots = mapped.sorted { lhs, rhs in
+                lhs.startDate == rhs.startDate
+                    ? lhs.endDate < rhs.endDate
+                    : lhs.startDate < rhs.startDate
+            }
+            self.publish(snapshots, generation: generation, loaded: true)
+        }
+    }
+
+    private func snapshot(_ event: EKEvent) -> MeetingEvent {
+        let title = event.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return MeetingEvent(
+            title: title?.isEmpty == false ? title! : "Untitled event",
+            startDate: event.startDate,
+            endDate: event.endDate,
+            meetingURL: bestMeetingURL(for: event),
+            // Calendar's EventKit deep link opens the event rather than only the app.
+            calendarURL: URL(string: "ical://ekevent/\(event.calendarItemIdentifier)")!
+        )
+    }
+
+    private func bestMeetingURL(for event: EKEvent) -> URL? {
+        var candidates: [MeetingURLCandidate] = []
+        if let url = event.url, let normalized = normalizedWebURL(url),
+           isKnownMeetingURL(normalized) {
+            candidates.append(MeetingURLCandidate(url: normalized, sourcePriority: 30))
+        }
+        for (text, priority) in [(event.location, 20), (event.notes, 10)] {
+            guard let text, !text.isEmpty, let linkDetector else { continue }
+            let range = NSRange(text.startIndex..., in: text)
+            for match in linkDetector.matches(in: text, range: range) {
+                guard let url = match.url, let normalized = normalizedWebURL(url),
+                      isKnownMeetingURL(normalized) else { continue }
+                candidates.append(MeetingURLCandidate(url: normalized, sourcePriority: priority))
+            }
+        }
+        return candidates.max { lhs, rhs in
+            if lhs.sourcePriority != rhs.sourcePriority {
+                return lhs.sourcePriority < rhs.sourcePriority
+            }
+            return lhs.url.absoluteString.count < rhs.url.absoluteString.count
+        }?.url
+    }
+
+    private func normalizedWebURL(_ url: URL) -> URL? {
+        var current = url
+        // Calendar providers can wrap links more than once. Bound the
+        // unwrapping so malformed self-referential links cannot recurse.
+        for _ in 0..<8 {
+            guard let scheme = current.scheme?.lowercased(),
+                  scheme == "https" || scheme == "http" else { return nil }
+            guard let components = URLComponents(
+                url: current, resolvingAgainstBaseURL: false),
+                let host = components.host?.lowercased()
+            else { return current }
+            func queryValue(_ name: String) -> String? {
+                components.queryItems?.first(where: { $0.name == name })?.value
+            }
+            var target: String?
+            if host.hasSuffix(".safelinks.protection.outlook.com") {
+                target = queryValue("url")
+            } else if (host == "google.com" || host.hasPrefix("google.")
+                        || host.hasPrefix("www.google.")), components.path == "/url" {
+                target = queryValue("q")
+            }
+            guard let target, let unwrapped = URL(string: target), unwrapped != current else {
+                return current
+            }
+            current = unwrapped
+        }
+        return current
+    }
+
+    private func isKnownMeetingURL(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        let path = url.path.lowercased()
+        if host == "meet.google.com" { return path.count > 1 }
+        if host == "zoom.us" || host.hasSuffix(".zoom.us")
+            || host == "zoomgov.com" || host.hasSuffix(".zoomgov.com") {
+            return path.hasPrefix("/j/") || path.hasPrefix("/my/")
+                || path.hasPrefix("/wc/") || path.hasPrefix("/w/")
+        }
+        if host == "teams.microsoft.com" || host == "teams.live.com"
+            || host == "teams.cloud.microsoft" {
+            return path.contains("meetup-join") || path.hasPrefix("/meet/")
+        }
+        return false
+    }
+
+    private func publish(
+        _ next: [MeetingEvent], generation: Int? = nil, loaded: Bool = true
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let generation, generation != self.reloadGeneration { return }
+            let permitted = EKEventStore.authorizationStatus(for: .event) == .fullAccess
+            let accepted = permitted ? next : []
+            let changed = self.events != accepted || self.agendaLoaded != (permitted && loaded)
+            self.events = accepted
+            self.agendaLoaded = permitted && loaded
+            self.updateItem()
+            if changed, openPopup == "meeting" { refreshPopup() }
+        }
+    }
+
+    private func remainingEvents(at now: Date) -> [MeetingEvent] {
+        let calendar = Calendar.current
+        let dayStart = calendar.startOfDay(for: now)
+        guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) else {
+            return []
+        }
+        return events.filter {
+            $0.startDate < dayEnd && $0.endDate > dayStart && $0.endDate > now
+        }
+    }
+
+    private func currentEvent(at now: Date) -> MeetingEvent? {
+        let remaining = remainingEvents(at: now)
+        let active = remaining.filter { $0.startDate <= now }
+        return active.first(where: { $0.meetingURL != nil })
+            ?? active.first ?? remaining.first
+    }
+
+    private func updateItem() {
+        let now = Date()
+        guard let event = currentEvent(at: now) else {
+            displayedEvent = nil
+            let showDone = agendaLoaded
+            set("meeting") {
+                $0.icon = showDone ? "󰄬" : ""
+                $0.label = showDone ? "Done" : ""
+                $0.compactLabel = showDone ? "" : nil
+                $0.iconColor = showDone ? palette.muted : nil
+                $0.labelColor = showDone ? palette.muted : nil
+                $0.drawing = showDone
+            }
+            return
+        }
+        displayedEvent = event
+        let untilStart = event.startDate.timeIntervalSince(now)
+        let nearStart = untilStart <= 10 * 60
+        let timing = timingText(for: event, at: now)
+        let title = event.title.count <= 42 ? event.title : String(event.title.prefix(41)) + "…"
+        set("meeting") {
+            $0.icon = "󰤙"
+            $0.label = "\(title) · \(timing)"
+            $0.compactLabel = timing
+            $0.iconColor = nearStart ? palette.accent : nil
+            $0.labelColor = nearStart ? palette.accent : nil
+            $0.drawing = true
+        }
+    }
+
+    private func timingText(for event: MeetingEvent, at now: Date) -> String {
+        let seconds = event.startDate.timeIntervalSince(now)
+        if seconds <= 60 { return event.meetingURL == nil ? "Now" : "Join" }
+        let minutes = max(1, Int(ceil(seconds / 60)))
+        if minutes < 60 { return "\(minutes)m" }
+        if minutes < 24 * 60 {
+            let remainder = minutes % 60
+            return remainder == 0 ? "\(minutes / 60)h" : "\(minutes / 60)h \(remainder)m"
+        }
+        let f = DateFormatter()
+        f.dateFormat = "EEE HH:mm"
+        return f.string(from: event.startDate).lowercased()
+    }
+
+    private func open(_ event: MeetingEvent) {
+        closePopup()
+        NSWorkspace.shared.open(event.meetingURL ?? event.calendarURL)
+    }
+}
+
+let meetingController = MeetingController()
+
+// --- Codex usage (CodexBar owns auth, provider APIs and caching) ------------
+struct CodexUsageWindow: Equatable {
+    let title: String
+    let usedPercent: Int
+    let resetDescription: String
+}
+
+struct CodexUsageSnapshot: Equatable {
+    let windows: [CodexUsageWindow]
+    let paceSummaries: [String]
+    let resetCredits: Int
+}
+
+let codexUsageURL = URL(string: "http://127.0.0.1:50891/usage?provider=codex")!
+let codexDashboardURL = URL(string: "http://127.0.0.1:50891/")!
+var codexUsage: CodexUsageSnapshot?
+var codexRefreshInFlight = false
+var codexLastSuccess: Date?
+
+func codexResetDescription(_ value: [String: Any]) -> String {
+    if let description = value["resetDescription"] as? String, !description.isEmpty {
+        return description
+    }
+    guard let raw = value["resetsAt"] as? String else { return "" }
+    let plain = ISO8601DateFormatter()
+    var date = plain.date(from: raw)
+    if date == nil {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions.insert(.withFractionalSeconds)
+        date = fractional.date(from: raw)
+    }
+    guard let date else { return raw }
+    let display = DateFormatter()
+    display.dateFormat = "MMM d 'at' h:mm a"
+    return display.string(from: date)
+}
+
+func parseCodexWindow(_ value: Any?, fallbackTitle: String) -> CodexUsageWindow? {
+    guard let value = value as? [String: Any],
+          let number = value["usedPercent"] as? NSNumber else { return nil }
+    let percent = min(100, max(0, number.intValue))
+    let minutes = (value["windowMinutes"] as? NSNumber)?.intValue
+    let title: String
+    switch minutes {
+    case 300: title = "5-hour"
+    case 10_080: title = "weekly"
+    case 43_200, 44_640: title = "monthly"
+    default: title = fallbackTitle
+    }
+    return CodexUsageWindow(
+        title: title,
+        usedPercent: percent,
+        resetDescription: codexResetDescription(value)
+    )
+}
+
+func parseCodexUsage(_ data: Data) -> CodexUsageSnapshot? {
+    guard let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+          let entry = entries.first(where: { ($0["provider"] as? String) == "codex" }) ?? entries.first,
+          let usage = entry["usage"] as? [String: Any] else { return nil }
+
+    var windows: [CodexUsageWindow] = []
+    if let primary = parseCodexWindow(usage["primary"], fallbackTitle: "primary") {
+        windows.append(primary)
+    }
+    if let secondary = parseCodexWindow(usage["secondary"], fallbackTitle: "secondary") {
+        windows.append(secondary)
+    }
+    for extra in usage["extraRateWindows"] as? [[String: Any]] ?? [] {
+        var title = extra["title"] as? String ?? "additional"
+        if title.lowercased().hasPrefix("codex ") { title = String(title.dropFirst(6)) }
+        if let window = parseCodexWindow(extra["window"], fallbackTitle: title) {
+            windows.append(CodexUsageWindow(
+                title: title,
+                usedPercent: window.usedPercent,
+                resetDescription: window.resetDescription
+            ))
+        }
+    }
+    guard !windows.isEmpty else { return nil }
+
+    var paceSummaries: [String] = []
+    if let pace = entry["pace"] as? [String: Any] {
+        for key in ["primary", "secondary"] {
+            guard let lane = pace[key] as? [String: Any],
+                  let summary = lane["summary"] as? String,
+                  !summary.isEmpty, !paceSummaries.contains(summary) else { continue }
+            paceSummaries.append(summary.replacingOccurrences(of: " | ", with: " · "))
+        }
+    }
+    let resetCredits = ((usage["codexResetCredits"] as? [String: Any])?["availableCount"] as? NSNumber)?.intValue ?? 0
+    return CodexUsageSnapshot(
+        windows: windows,
+        paceSummaries: paceSummaries,
+        resetCredits: resetCredits
+    )
+}
+
+func updateCodexItem() {
+    guard let usage = codexUsage,
+          let constrained = usage.windows.max(by: { $0.usedPercent < $1.usedPercent }) else {
+        set("codex") {
+            $0.icon = ""
+            $0.label = ""
+            $0.compactLabel = nil
+            $0.iconColor = nil
+            $0.labelColor = nil
+            $0.drawing = false
+        }
+        return
+    }
+    let color = constrained.usedPercent >= 90 ? palette.red
+        : (constrained.usedPercent >= 75 ? palette.yellow : palette.green)
+    set("codex") {
+        $0.icon = "󱙺"
+        $0.label = "Codex \(constrained.usedPercent)%"
+        $0.compactLabel = "\(constrained.usedPercent)%"
+        $0.iconColor = color
+        $0.labelColor = color
+        $0.drawing = true
+    }
+}
+
+func updateCodexUsage() {
+    guard !codexRefreshInFlight else { return }
+    codexRefreshInFlight = true
+    var request = URLRequest(url: codexUsageURL)
+    request.timeoutInterval = 15
+    URLSession.shared.dataTask(with: request) { data, _, _ in
+        let next = data.flatMap(parseCodexUsage)
+        DispatchQueue.main.async {
+            codexRefreshInFlight = false
+            guard let next else {
+                // A brief outage must not flicker the pill, but stale quota
+                // must not masquerade as live forever after the service stops.
+                if let last = codexLastSuccess, Date().timeIntervalSince(last) >= 300 {
+                    codexUsage = nil
+                    updateCodexItem()
+                    if openPopup == "codex" { closePopup() }
+                }
+                return
+            }
+            codexLastSuccess = Date()
+            codexUsage = next
+            updateCodexItem()
+            if openPopup == "codex" { refreshPopup() }
+        }
+    }.resume()
+}
+
 // --- clock (no publisher: the one honest timer, aligned to the minute)
 func updateClock() {
     let f = DateFormatter()
     f.dateFormat = "EEE dd MMM  HH:mm"
     set("clock") { $0.icon = "󰃰"; $0.label = f.string(from: Date()) }
+    meetingController.minuteTick()
 }
 
 // --- battery (IOPS publishes, capacity ticks included)
@@ -1666,6 +2134,31 @@ func bluetoothRows() -> [PopupRow] {
     return rows
 }
 
+func codexRows() -> [PopupRow] {
+    guard let usage = codexUsage,
+          let highest = usage.windows.map(\.usedPercent).max() else { return [] }
+    var rows = [PopupRow(text: "Codex usage", hero: true)]
+    for window in usage.windows {
+        let reset = window.resetDescription.isEmpty ? "" : " · resets \(window.resetDescription)"
+        rows.append(PopupRow(
+            text: "\(window.title) \(window.usedPercent)%\(reset)",
+            highlight: window.usedPercent == highest
+        ))
+    }
+    for summary in usage.paceSummaries {
+        rows.append(PopupRow(text: summary, dim: true))
+    }
+    if usage.resetCredits > 0 {
+        let noun = usage.resetCredits == 1 ? "credit" : "credits"
+        rows.append(PopupRow(text: "\(usage.resetCredits) reset \(noun) available"))
+    }
+    rows.append(PopupRow(text: "open CodexBar dashboard…", dim: true, action: {
+        NSWorkspace.shared.open(codexDashboardURL)
+        closePopup()
+    }))
+    return rows
+}
+
 func weatherRows() -> [PopupRow] {
     guard let w = weather else { return [] }
     var rows: [PopupRow] = [PopupRow(text: "\(w.emoji) \(w.temp)°C \(w.desc)", hero: true)]
@@ -1719,7 +2212,9 @@ func appleRows() -> [PopupRow] {
 func popupRows(for name: String) -> [PopupRow] {
     switch name {
     case "apple": return appleMenuRows()
+    case "meeting": return meetingController.popupRows()
     case "clock": return calendarRows()
+    case "codex": return codexRows()
     case "weather": return weatherRows()
     case "brightness": return brightnessRows()
     case "volume": return volumeRows()
@@ -2461,6 +2956,11 @@ let terminalApp: String = {
     return "Ghostty"
 }()
 
+// launchd supplies only the system PATH, so terminal emulators cannot find
+// Homebrew commands by name when the activity pill launches them.
+let btopBin = ["/opt/homebrew/bin/btop", "/usr/local/bin/btop"]
+    .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) ?? "btop"
+
 final class BarView: NSView {
     weak var surface: BarSurface?
     var chipRects: [(String, NSRect)] = []
@@ -2617,19 +3117,42 @@ final class BarView: NSView {
         // media: centred where there is room, in the left cluster where a
         // notch owns the middle
         let mediaW = mediaSize(chipFont, iconFont)
+        var occupiedThrough = leftEdge
         if mediaW > 0 {
-            drawMedia(at: surface.notched ? leftEdge + gap : (bounds.width - mediaW) / 2,
-                      chipFont, iconFont)
+            let mediaX = surface.notched ? leftEdge + gap : (bounds.width - mediaW) / 2
+            drawMedia(at: mediaX, chipFont, iconFont)
+            occupiedThrough = max(occupiedThrough, mediaX + mediaW)
+        }
+        if surface.notched, let rightArea = surface.screen.auxiliaryTopRightArea {
+            let notchRight = rightArea.minX - surface.screen.frame.minX
+            occupiedThrough = max(occupiedThrough, notchRight)
         }
 
         // right cluster: laid out from the right edge inwards, so a pill
         // changing width never shifts the ones outside it
         var cursor = bounds.maxX - padLeft
         for name in rightOrder.reversed() {
-            guard let item = rightItems[name], item.drawing,
+            guard var item = rightItems[name], item.drawing,
                   !(item.icon.isEmpty && item.label.isEmpty) else { continue }
             let labelFont = chipFont
+
+            func measuredWidth(_ candidate: BarItem) -> CGFloat {
+                let iconInk = candidate.icon.isEmpty ? 0 : inkBox(candidate.icon, iconFont).width
+                let labelAdv = candidate.label.isEmpty ? 0 : advance(candidate.label, labelFont)
+                let innerGap: CGFloat = !candidate.icon.isEmpty && !candidate.label.isEmpty ? 7 : 0
+                return 10 + iconInk + innerGap + labelAdv + 10
+            }
+
+            // Responsive items use their compact label before colliding with
+            // media, the left cluster, or the notch on this display.
+            if let compact = item.compactLabel {
+                let budget = cursor - occupiedThrough - gap
+                if measuredWidth(item) > budget { item.label = compact }
+                if measuredWidth(item) > budget { continue }
+            }
+
             let iconColor = item.iconColor ?? palette.label
+            let labelColor = item.labelColor ?? palette.label
             let hasIcon = !item.icon.isEmpty
             let hasLabel = !item.label.isEmpty
             // An icon-only pill is sized and centred on the glyph's INK, so
@@ -2652,7 +3175,7 @@ final class BarView: NSView {
                                             width: iconInk, height: pill.height))
             }
             if hasLabel {
-                drawText(item.label, labelFont, palette.label,
+                drawText(item.label, labelFont, labelColor,
                          leftAt: pill.minX + 10 + iconInk + innerGap, midY: pill.midY)
             }
             itemRects.append((name, NSRect(x: pill.minX, y: 0, width: width, height: barHeight)))
@@ -2727,6 +3250,11 @@ final class BarView: NSView {
             closePopup()
             return
         }
+        if name == "meeting" {
+            closePopup()
+            meetingController.openCurrent()
+            return
+        }
         // an item with a popup toggles it; the rest still act directly
         if !popupRows(for: name).isEmpty, let surface {
             let anchor = window?.convertToScreen(convert(rect, to: nil)) ?? rect
@@ -2740,10 +3268,18 @@ final class BarView: NSView {
                 URL(string: "x-apple.systempreferences:com.apple.Battery-Settings.extension")!)
         case "activity":
             DispatchQueue.global(qos: .userInitiated).async {
-                _ = shell("/usr/bin/open", ["-na", terminalApp, "--args", "--title=omacosy-activity", "-e", "btop"])
+                _ = shell("/usr/bin/open", ["-na", terminalApp, "--args", "--title=omacosy-activity", "-e", btopBin])
             }
         default: break
         }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        guard let name = hit(event), name == "meeting",
+              let rect = itemRects.first(where: { $0.0 == name })?.1,
+              let surface else { return }
+        let anchor = window?.convertToScreen(convert(rect, to: nil)) ?? rect
+        showPopup(name, under: anchor, on: surface)
     }
 
     // A trackpad flick delivers dozens of precise events plus a momentum
@@ -2799,6 +3335,15 @@ final class BarWindow: NSWindow {
 // was built.
 let stackOffset: CGFloat = ProcessInfo.processInfo.environment["OMACOSY_BAR_STACK"] == nil ? 0 : barHeight
 
+// AeroSpace reserves the strip above its tiled windows, so the bar can
+// rest below normal windows and disappear behind fullscreen content.
+// OmniWM does not reliably reserve that strip across its layout engines
+// and versions; at the same negative level an ordinary tile covers the
+// bar and leaves only the top-edge hover reveal reachable.
+func restingBarLevel() -> NSWindow.Level {
+    omniwmActive() ? .floating : NSWindow.Level(rawValue: -20)
+}
+
 // One surface per display. Each owns its screen's workspace set and its
 // own window; everything else it reads from the shared model.
 final class BarSurface {
@@ -2836,7 +3381,7 @@ final class BarSurface {
         // y=0 by z-order alone. Being below windows is still worth it: the
         // bar can never float over an app, and on a flat display fullscreen
         // covers it for free.
-        window.level = NSWindow.Level(rawValue: -20)
+        window.level = restingBarLevel()
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         window.acceptsMouseMovedEvents = true // tracking areas need the moves
         view = BarView(frame: NSRect(origin: .zero, size: frame.size))
@@ -2849,6 +3394,7 @@ final class BarSurface {
         let frame = NSRect(x: screen.frame.minX, y: screen.frame.maxY - barHeight - stackOffset,
                            width: screen.frame.width, height: barHeight)
         window.setFrame(frame, display: true)
+        window.level = revealed ? barRevealLevel : restingBarLevel()
         view.frame = NSRect(origin: .zero, size: frame.size)
     }
 }
@@ -2995,7 +3541,6 @@ func fullscreenDisplays() -> Set<CGDirectDisplayID> {
 // While revealed the bar has to climb ABOVE the fullscreen window — its
 // resting level of -20 is what hides it in the first place — and it drops
 // back down when the pointer leaves.
-let barBaseLevel = NSWindow.Level(rawValue: -20)
 // Revealed, the bar has to clear omacosy-borders' fullscreen shroud, which
 // sits at .screenSaver (1000) and blacks out the camera strip so that
 // aerospace-fullscreen reads as true fullscreen on a notched display.
@@ -3009,7 +3554,7 @@ func setRevealed(_ show: Bool) {
     guard show != revealed else { return }
     revealed = show
     for surface in surfaces {
-        surface.window.level = show ? barRevealLevel : barBaseLevel
+        surface.window.level = show ? barRevealLevel : restingBarLevel()
     }
     updateBarVisibility()
 }
@@ -3237,7 +3782,8 @@ for event in [NSWorkspace.didLaunchApplicationNotification,
               NSWorkspace.didTerminateApplicationNotification] {
     NSWorkspace.shared.notificationCenter.addObserver(forName: event, object: nil, queue: .main) { note in
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-              app.bundleIdentifier == omniwmBundleID else { return }
+              let bundleID = app.bundleIdentifier,
+              omniwmBundleIDs.contains(bundleID) else { return }
         let launched = event == NSWorkspace.didLaunchApplicationNotification
         tlog("wm: OmniWM \(launched ? "launched" : "quit")")
         if launched { startOmniWatch() } else { stopOmniWatch() }
@@ -3579,6 +4125,7 @@ func scheduleClock() {
 scheduleClock()
 
 Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { _ in updateWeather() }
+Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in updateCodexUsage() }
 
 // --- go -------------------------------------------------------------------
 
@@ -3602,6 +4149,8 @@ updateBattery()
 updateBrightness()
 updateWifi()
 updateWeather()
+updateCodexUsage()
+meetingController.start()
 repaint()
 primeMedia()
 startOmniWatch() // a no-op under aerospace; the WM observer handles switches

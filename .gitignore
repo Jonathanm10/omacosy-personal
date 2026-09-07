@@ -2,5 +2,6 @@
 *.bak.*
 /omacosy-bar.app/
 /omacosy-gesture.app/
+/build/
 config/apps.local.conf
 config/aerospace/aerospace.toml

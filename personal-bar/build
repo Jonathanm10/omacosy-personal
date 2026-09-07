@@ -1,0 +1,60 @@
+#!/bin/bash
+# Build only Jonathan's personal bar into this checkout.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_DIR="$REPO/build"
+OUTPUT="$BUILD_DIR/omacosy-bar.app"
+mkdir -p "$BUILD_DIR"
+TEMP="$(mktemp -d "$BUILD_DIR/.personal-bar.XXXXXX")"
+trap 'rm -rf "$TEMP"' EXIT
+APP="$TEMP/omacosy-bar.app"
+BIN="$APP/Contents/MacOS/omacosy-bar"
+mkdir -p "$APP/Contents/MacOS"
+
+swiftc -O \
+  -F /System/Library/PrivateFrameworks \
+  -framework SkyLight \
+  -framework DisplayServices \
+  -Xlinker -sectcreate \
+  -Xlinker __TEXT \
+  -Xlinker __info_plist \
+  -Xlinker "$REPO/helper/bar-info.plist" \
+  -o "$BIN" \
+  "$REPO/helper/bar.swift"
+cp "$REPO/helper/bar-info.plist" "$APP/Contents/Info.plist"
+printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+# Keep com.omacosy.bar and the exact existing developer identity so Calendar,
+# Bluetooth, and Location grants remain associated with this application. This
+# machine has had more than one Apple Development certificate, so the generic
+# name is not safe: ask the currently installed bundle which one it used.
+SIGNING_IDENTITY="${OMACOSY_SIGNING_IDENTITY:-}"
+if [ -z "$SIGNING_IDENTITY" ]; then
+  for existing in "$OUTPUT" "$HOME/.local/share/omacosy/omacosy-bar.app"; do
+    if [ -e "$existing" ]; then
+      SIGNING_IDENTITY="$(codesign -dvv "$existing" 2>&1 \
+        | sed -n 's/^Authority=\(Apple Development:.*\)$/\1/p' | head -1)"
+      [ -n "$SIGNING_IDENTITY" ] && break
+    fi
+  done
+fi
+if [ -z "$SIGNING_IDENTITY" ] \
+  || ! security find-identity -p codesigning -v 2>/dev/null | grep -Fq "\"$SIGNING_IDENTITY\""; then
+  echo "personal-bar: the existing Apple Development identity is unavailable; preserving the current build" >&2
+  exit 1
+fi
+codesign -f -s "$SIGNING_IDENTITY" --identifier com.omacosy.bar "$APP"
+codesign --verify --deep --strict "$APP"
+
+PREVIOUS="$BUILD_DIR/.omacosy-bar.previous"
+rm -rf "$PREVIOUS"
+if [ -e "$OUTPUT" ]; then mv "$OUTPUT" "$PREVIOUS"; fi
+if mv "$APP" "$OUTPUT"; then
+  rm -rf "$PREVIOUS"
+else
+  if [ -e "$PREVIOUS" ]; then mv "$PREVIOUS" "$OUTPUT"; fi
+  exit 1
+fi
+
+echo "personal-bar: built $OUTPUT"

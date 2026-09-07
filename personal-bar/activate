@@ -1,0 +1,56 @@
+#!/bin/bash
+# Make the separately built personal bar the only active omacosy bar.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+APP="$REPO/build/omacosy-bar.app"
+BIN="$APP/Contents/MacOS/omacosy-bar"
+PERSONAL_PLIST="$HOME/Library/LaunchAgents/com.omacosy.personal-bar.plist"
+UPSTREAM_PLIST="$HOME/Library/LaunchAgents/com.omacosy.bar.plist"
+BACKUP_DIR="$HOME/.config/omacosy-personal/backups/launch-agents"
+UID_N="$(id -u)"
+
+if [ ! -x "$BIN" ]; then
+  echo "personal-bar: build is missing; run $REPO/personal-bar/build" >&2
+  exit 1
+fi
+codesign --verify --deep --strict "$APP"
+mkdir -p "$HOME/Library/LaunchAgents" "$BACKUP_DIR" "$HOME/.local/bin"
+
+# A normal upstream install recreates this plist and starts its plain bar.
+# Archive rather than delete it, then remove its job before loading ours.
+launchctl bootout "gui/$UID_N/com.omacosy.bar" 2>/dev/null || true
+if [ -e "$UPSTREAM_PLIST" ]; then
+  stamp="$(date +%Y%m%d-%H%M%S)-$$"
+  mv "$UPSTREAM_PLIST" "$BACKUP_DIR/com.omacosy.bar.$stamp.plist"
+fi
+launchctl bootout "gui/$UID_N/com.omacosy.personal-bar" 2>/dev/null || true
+
+PLIST_TEMP="$PERSONAL_PLIST.tmp.$$"
+trap 'rm -f "$PLIST_TEMP"' EXIT
+cat > "$PLIST_TEMP" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.omacosy.personal-bar</string>
+  <key>ProgramArguments</key><array><string>$BIN</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict><key>OMACOSY_MANAGED</key><string>1</string></dict>
+  <key>StandardErrorPath</key><string>/tmp/omacosy-personal-bar.err</string>
+</dict>
+</plist>
+PLIST
+plutil -lint "$PLIST_TEMP" >/dev/null
+mv "$PLIST_TEMP" "$PERSONAL_PLIST"
+trap - EXIT
+launchctl bootstrap "gui/$UID_N" "$PERSONAL_PLIST"
+launchctl kickstart -k "gui/$UID_N/com.omacosy.personal-bar"
+
+# Upstream's installer rewrites this symlink. The wrapper restores both this
+# link and the personal launch agent after every ordinary omacosy-update.
+ln -sfn "$REPO/personal-bar/update-upstream" "$HOME/.local/bin/omacosy-update"
+
+echo "personal-bar: active as com.omacosy.personal-bar"

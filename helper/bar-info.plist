@@ -14,6 +14,8 @@
   <key>LSUIElement</key><true/>
   <key>NSBluetoothAlwaysUsageDescription</key>
   <string>omacosy-bar shows how many bluetooth devices are connected in the status bar.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>omacosy-bar reads upcoming events to show the next meeting and open its call link.</string>
   <key>NSLocationWhenInUseUsageDescription</key>
   <string>macOS treats the name of the wi-fi network you are on as location data. omacosy-bar shows that name in the status bar; it never reads your position.</string>
 </dict>

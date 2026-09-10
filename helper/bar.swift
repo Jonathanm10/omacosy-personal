@@ -606,7 +606,18 @@ struct BarItem: Equatable {
 
 // screen order, left to right
 let rightOrder = ["codex", "meeting", "weather", "wifi", "bluetooth", "brightness", "volume", "battery", "clock", "activity"]
+// On the built-in MacBook panel these four yield so the Codex pill keeps its
+// fixed width; Control Center still owns the same controls there.
+let builtinOmitRight = Set(["weather", "wifi", "bluetooth", "brightness"])
 var rightItems: [String: BarItem] = [:]
+
+func rightItemWidth(_ name: String, _ item: BarItem, iconFont: NSFont, labelFont: NSFont) -> CGFloat {
+    if name == "codex" { return 218 }
+    let iconInk = item.icon.isEmpty ? 0 : inkBox(item.icon, iconFont).width
+    let labelAdv = item.label.isEmpty ? 0 : advance(item.label, labelFont)
+    let innerGap: CGFloat = !item.icon.isEmpty && !item.label.isEmpty ? 7 : 0
+    return 10 + iconInk + innerGap + labelAdv + 10
+}
 
 func set(_ name: String, _ mutate: (inout BarItem) -> Void) {
     var item = rightItems[name] ?? BarItem()
@@ -946,7 +957,8 @@ final class MeetingController {
 
 let meetingController = MeetingController()
 
-// --- Codex usage (CodexBar owns auth, provider APIs and caching) ------------
+// --- AI usage (CodexBar owns auth, provider APIs and caching) ---------------
+// BEGIN AI USAGE MODEL — extracted by personal-bar/test-usage for fixture tests.
 struct CodexUsageWindow: Equatable {
     let title: String
     let usedPercent: Int
@@ -959,11 +971,134 @@ struct CodexUsageSnapshot: Equatable {
     let resetCredits: Int
 }
 
-let codexUsageURL = URL(string: "http://127.0.0.1:50891/usage?provider=codex")!
+struct AIProvider: Equatable {
+    let id: String
+    let name: String
+    let symbol: String
+}
+let aiProviders = [
+    AIProvider(id: "codex", name: "Codex", symbol: "◎"),
+    AIProvider(id: "claude", name: "Claude", symbol: "✳"),
+    AIProvider(id: "cursor", name: "Cursor", symbol: "➤")
+]
+// CodexBar UsagePaceText calls negative usage-minus-expected delta "in reserve".
+struct AIReserve: Equatable {
+    let percent: Int // positive reserve, negative deficit; zero means On pace
+    let scope: String
+    var text: String { percent == 0 ? "0%" : String(format: "%+d%%", percent) }
+    var detail: String {
+        percent == 0 ? "\(scope) · On pace" : "\(scope) · \(abs(percent))% in \(percent > 0 ? "reserve" : "deficit")"
+    }
+    var severity: Int { percent < -6 ? 2 : (percent < 0 ? 1 : 0) }
+}
+
+func aiFiniteNumber(_ value: Any?) -> Double? {
+    guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+          number.doubleValue.isFinite else { return nil }
+    return number.doubleValue
+}
+
+func aiUsageDate(_ value: Any?) -> Date? {
+    guard let raw = value as? String else { return nil }
+    let formatter = ISO8601DateFormatter()
+    if let date = formatter.date(from: raw) { return date }
+    formatter.formatOptions.insert(.withFractionalSeconds)
+    return formatter.date(from: raw)
+}
+
+func codexBarWeeklyWorkDays() -> Int? {
+    // Same ordered GUI domains/key as CodexBarCLI/CLIHelpers.swift; no credential reads.
+    for domain in ["com.steipete.codexbar", "com.steipete.codexbar.debug"] {
+        if let value = UserDefaults(suiteName: domain)?.object(forKey: "weeklyProgressWorkDays") as? Int {
+            return value
+        }
+    }
+    return nil // CodexBar's unset default is continuous seven-day progress.
+}
+
+func fableReserve(_ window: [String: Any], now: Date, workDays: Int?,
+                  calendar: Calendar = .current) -> AIReserve? {
+    guard let used = aiFiniteNumber(window["usedPercent"]),
+          let reset = aiUsageDate(window["resetsAt"]),
+          aiFiniteNumber(window["windowMinutes"]) == 10080 else { return nil }
+    let duration: TimeInterval = 10080 * 60
+    let remaining = reset.timeIntervalSince(now)
+    guard remaining > 0, remaining <= duration else { return nil }
+    let elapsed = duration - remaining
+    let actual = min(100, max(0, used))
+    guard elapsed > 0 || actual == 0 else { return nil }
+    var expected = elapsed / duration * 100
+    if let workDays, workDays >= 2, workDays < 7 {
+        // UsagePace.workdayProgress: local calendar day slices, Monday = day 1.
+        var cursor = reset.addingTimeInterval(-duration)
+        var total: TimeInterval = 0
+        var consumed: TimeInterval = 0
+        while cursor < reset {
+            guard let nextDay = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: cursor)),
+                  nextDay > cursor else { return nil }
+            let end = min(nextDay, reset)
+            let weekday = calendar.component(.weekday, from: cursor)
+            if (weekday == 1 ? 7 : weekday - 1) <= workDays {
+                total += end.timeIntervalSince(cursor)
+                if now > cursor { consumed += min(now, end).timeIntervalSince(cursor) }
+            }
+            cursor = end
+        }
+        guard total > 0 else { return nil }
+        expected = min(100, max(0, consumed / total * 100))
+    }
+    // Match the GUI's weekly visibility gate and unrounded ±2-point On pace band.
+    guard expected >= 3 || actual >= 100 else { return nil }
+    let reserve = expected - actual
+    return AIReserve(percent: abs(reserve) <= 2 ? 0 : Int(reserve.rounded()), scope: "Fable weekly")
+}
+
+func parseAIReserve(_ entry: [String: Any], now: Date, workDays: Int?) -> AIReserve? {
+    guard let usage = entry["usage"] as? [String: Any] else { return nil }
+    if entry["provider"] as? String == "claude" {
+        guard let extra = (usage["extraRateWindows"] as? [[String: Any]])?.first(where: {
+            $0["id"] as? String == "claude-weekly-scoped-fable"
+        }), let window = extra["window"] as? [String: Any] else { return nil }
+        return fableReserve(window, now: now, workDays: workDays)
+    }
+    let lane: String
+    let scope: String
+    switch entry["provider"] as? String {
+    case "codex": lane = "secondary"; scope = "Codex weekly"
+    case "cursor": lane = "tertiary"; scope = "Third Party monthly"
+    default: return nil
+    }
+    guard parseCodexWindow(usage[lane], fallbackTitle: lane) != nil,
+          let pace = (entry["pace"] as? [String: Any])?[lane] as? [String: Any],
+          let delta = aiFiniteNumber(pace["deltaPercent"]), abs(delta) <= 100,
+          let stage = pace["stage"] as? String else { return nil }
+    switch stage {
+    case "onTrack": return AIReserve(percent: 0, scope: scope)
+    case "slightlyAhead", "ahead", "farAhead": guard delta > 0 else { return nil }
+    case "slightlyBehind", "behind", "farBehind": guard delta < 0 else { return nil }
+    default: return nil
+    }
+    return AIReserve(percent: -Int(delta.rounded()), scope: scope)
+}
+
+struct AIUsageState: Equatable {
+    var usage: CodexUsageSnapshot?
+    var status: String
+    var updatedAt: Date? = nil
+    var stale = false
+    var detail: String {
+        guard let updatedAt else { return status }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return "\(stale ? "Cached · " : "")\(status) · updated \(formatter.string(from: updatedAt))"
+    }
+    var reserve: AIReserve? = nil
+}
+let codexUsageURL = URL(string: "http://127.0.0.1:50891/usage")!
 let codexDashboardURL = URL(string: "http://127.0.0.1:50891/")!
-var codexUsage: CodexUsageSnapshot?
+var aiUsage: [String: AIUsageState] = [:]
 var codexRefreshInFlight = false
-var codexLastSuccess: Date?
 
 func codexResetDescription(_ value: [String: Any]) -> String {
     if let description = value["resetDescription"] as? String, !description.isEmpty {
@@ -985,8 +1120,9 @@ func codexResetDescription(_ value: [String: Any]) -> String {
 
 func parseCodexWindow(_ value: Any?, fallbackTitle: String) -> CodexUsageWindow? {
     guard let value = value as? [String: Any],
-          let number = value["usedPercent"] as? NSNumber else { return nil }
-    let percent = min(100, max(0, number.intValue))
+          let number = value["usedPercent"] as? NSNumber,
+          CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite else { return nil }
+    let percent = Int(min(100, max(0, number.doubleValue)))
     let minutes = (value["windowMinutes"] as? NSNumber)?.intValue
     let title: String
     switch minutes {
@@ -1002,10 +1138,8 @@ func parseCodexWindow(_ value: Any?, fallbackTitle: String) -> CodexUsageWindow?
     )
 }
 
-func parseCodexUsage(_ data: Data) -> CodexUsageSnapshot? {
-    guard let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-          let entry = entries.first(where: { ($0["provider"] as? String) == "codex" }) ?? entries.first,
-          let usage = entry["usage"] as? [String: Any] else { return nil }
+func parseCodexUsage(_ entry: [String: Any]) -> CodexUsageSnapshot? {
+    guard let usage = entry["usage"] as? [String: Any] else { return nil }
 
     var windows: [CodexUsageWindow] = []
     if let primary = parseCodexWindow(usage["primary"], fallbackTitle: "primary") {
@@ -1013,6 +1147,9 @@ func parseCodexUsage(_ data: Data) -> CodexUsageSnapshot? {
     }
     if let secondary = parseCodexWindow(usage["secondary"], fallbackTitle: "secondary") {
         windows.append(secondary)
+    }
+    if let tertiary = parseCodexWindow(usage["tertiary"], fallbackTitle: "tertiary") {
+        windows.append(tertiary)
     }
     for extra in usage["extraRateWindows"] as? [[String: Any]] ?? [] {
         var title = extra["title"] as? String ?? "additional"
@@ -1044,56 +1181,148 @@ func parseCodexUsage(_ data: Data) -> CodexUsageSnapshot? {
     )
 }
 
-func updateCodexItem() {
-    guard let usage = codexUsage,
-          let constrained = usage.windows.max(by: { $0.usedPercent < $1.usedPercent }) else {
-        set("codex") {
-            $0.icon = ""
-            $0.label = ""
-            $0.compactLabel = nil
-            $0.iconColor = nil
-            $0.labelColor = nil
-            $0.drawing = false
+func parseAIUsage(_ data: Data, now: Date = Date(), workDays: Int? = codexBarWeeklyWorkDays()) -> [String: AIUsageState]? {
+    guard let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
+    var result: [String: AIUsageState] = [:]
+    for provider in aiProviders {
+        let matching = entries.filter { $0["provider"] as? String == provider.id }
+        var state = AIUsageState(status: matching.isEmpty ? "Not enabled in CodexBar" : "Unavailable · check CodexBar")
+        for entry in matching {
+            guard entry["error"] == nil, let snapshot = parseCodexUsage(entry) else { continue }
+            let raw = (entry["usage"] as? [String: Any])?["updatedAt"] as? String
+            let formatter = ISO8601DateFormatter()
+            var updated = raw.flatMap { formatter.date(from: $0) }
+            if updated == nil {
+                formatter.formatOptions.insert(.withFractionalSeconds)
+                updated = raw.flatMap { formatter.date(from: $0) }
+            }
+            guard let updated, now.timeIntervalSince(updated) < 3600,
+                  updated.timeIntervalSince(now) < 60 else {
+                if state.usage == nil { state = AIUsageState(status: "Stale data · refresh in CodexBar") }
+                continue
+            }
+            let reserve = parseAIReserve(entry, now: now, workDays: workDays)
+            let candidate = AIUsageState(usage: snapshot, status: reserve?.detail ?? "Reserve unavailable · missing scoped pace/window",
+                                         updatedAt: updated, stale: now.timeIntervalSince(updated) >= 300, reserve: reserve)
+            if state.updatedAt == nil || updated > state.updatedAt! { state = candidate }
+            // Prefer the newest usable account over stale data or another account's error.
         }
-        return
+        if state.usage == nil, state.status.hasPrefix("Unavailable"),
+           matching.contains(where: { $0["error"] != nil }) {
+            state.status = "Connection needed · sign in / refresh in CodexBar"
+        }
+        result[provider.id] = state
     }
-    let color = constrained.usedPercent >= 90 ? palette.red
-        : (constrained.usedPercent >= 75 ? palette.yellow : palette.green)
+    return result
+}
+func reduceAIUsage(previous: [String: AIUsageState], data: Data?, now: Date,
+                   providerIDs: [String] = aiProviders.map(\.id)) -> [String: AIUsageState] {
+    let incoming = data.flatMap { parseAIUsage($0, now: now) }
+    var result = previous
+    for provider in aiProviders where providerIDs.contains(provider.id) {
+        var next = incoming?[provider.id] ?? AIUsageState(status: "CodexBar unavailable · retry refresh")
+        if let old = previous[provider.id], let timestamp = old.updatedAt,
+           now.timeIntervalSince(timestamp) < 3600,
+           next.updatedAt == nil || next.updatedAt! < timestamp {
+            let reason = next.usage == nil ? next.status : "Older response · awaiting refresh"
+            next = old
+            next.stale = true
+            next.status = reason
+        }
+        result[provider.id] = next
+    }
+    return result
+}
+// END AI USAGE MODEL
+
+func updateCodexItem() {
     set("codex") {
-        $0.icon = "󱙺"
-        $0.label = "Codex \(constrained.usedPercent)%"
-        $0.compactLabel = "\(constrained.usedPercent)%"
-        $0.iconColor = color
-        $0.labelColor = color
+        $0.icon = ""
+        $0.label = aiProviders.map { provider in
+            let percent = aiUsage[provider.id]?.reserve?.text ?? "—"
+            return "\(provider.name) \(percent)"
+        }.joined(separator: " | ")
+        // Keep all three segments together; retain the bar's collision guard.
+        $0.compactLabel = $0.label
+        $0.iconColor = nil
+        $0.labelColor = nil
         $0.drawing = true
     }
 }
 
 func updateCodexUsage() {
+    updateCursorUsage()
     guard !codexRefreshInFlight else { return }
     codexRefreshInFlight = true
+    updateCodexItem()
     var request = URLRequest(url: codexUsageURL)
     request.timeoutInterval = 15
-    URLSession.shared.dataTask(with: request) { data, _, _ in
-        let next = data.flatMap(parseCodexUsage)
+    URLSession.shared.dataTask(with: request) { data, response, error in
+        let success = error == nil && (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } == true
+        let responseData = success ? data : nil
         DispatchQueue.main.async {
             codexRefreshInFlight = false
-            guard let next else {
-                // A brief outage must not flicker the pill, but stale quota
-                // must not masquerade as live forever after the service stops.
-                if let last = codexLastSuccess, Date().timeIntervalSince(last) >= 300 {
-                    codexUsage = nil
-                    updateCodexItem()
-                    if openPopup == "codex" { closePopup() }
-                }
-                return
-            }
-            codexLastSuccess = Date()
-            codexUsage = next
+            // Retain each provider independently, with cached status and a one-hour expiry.
+            aiUsage = reduceAIUsage(previous: aiUsage, data: responseData, now: Date(), providerIDs: ["codex", "claude"])
             updateCodexItem()
             if openPopup == "codex" { refreshPopup() }
         }
     }.resume()
+}
+
+// BEGIN CURSOR CLI — also compiled by personal-bar/test-usage.
+// Run only off the main queue. Nonblocking reads bound memory and wall time,
+// including a CLI that hangs or leaves stdout open in a child process.
+func cursorCLIUsage(executable: String = "/opt/homebrew/bin/codexbar",
+                    arguments: [String] = ["usage", "--provider", "cursor", "--json"],
+                    timeout: TimeInterval = 30, outputLimit: Int = 1_048_576) -> Data? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    process.standardInput = FileHandle.nullDevice
+    let handle = pipe.fileHandleForReading
+    defer { try? handle.close() }
+    let fd = handle.fileDescriptor
+    guard fcntl(fd, F_SETFL, O_NONBLOCK) != -1 else { return nil }
+    guard (try? process.run()) != nil else { return nil }
+    try? pipe.fileHandleForWriting.close()
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    var output = Data()
+    var buffer = [UInt8](repeating: 0, count: 8192)
+    while ProcessInfo.processInfo.systemUptime < deadline {
+        let count = read(fd, &buffer, buffer.count)
+        if count > 0 {
+            guard output.count + count <= outputLimit else { break }
+            output.append(contentsOf: buffer.prefix(count))
+        } else if count == 0 && !process.isRunning {
+            return process.terminationStatus == 0 ? output : nil
+        } else if count < 0 && errno != EAGAIN && errno != EINTR {
+            break
+        } else {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+    }
+    if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+    return nil
+}
+// END CURSOR CLI
+
+var cursorRefreshInFlight = false
+func updateCursorUsage() {
+    guard !cursorRefreshInFlight else { return }
+    cursorRefreshInFlight = true
+    DispatchQueue.global(qos: .utility).async {
+        let data = cursorCLIUsage()
+        DispatchQueue.main.async {
+            cursorRefreshInFlight = false
+            aiUsage = reduceAIUsage(previous: aiUsage, data: data, now: Date(), providerIDs: ["cursor"])
+            updateCodexItem()
+            if openPopup == "codex" { refreshPopup() }
+        }
+    }
 }
 
 // --- clock (no publisher: the one honest timer, aligned to the minute)
@@ -2135,23 +2364,30 @@ func bluetoothRows() -> [PopupRow] {
 }
 
 func codexRows() -> [PopupRow] {
-    guard let usage = codexUsage,
-          let highest = usage.windows.map(\.usedPercent).max() else { return [] }
-    var rows = [PopupRow(text: "Codex usage", hero: true)]
-    for window in usage.windows {
-        let reset = window.resetDescription.isEmpty ? "" : " · resets \(window.resetDescription)"
-        rows.append(PopupRow(
-            text: "\(window.title) \(window.usedPercent)%\(reset)",
-            highlight: window.usedPercent == highest
-        ))
+    var rows = [PopupRow(text: "AI reserve · versus expected usage", hero: true),
+                PopupRow(text: "+ reserve · − deficit · 0 on pace · dot cached · — unknown", dim: true)]
+    for provider in aiProviders {
+        rows.append(PopupRow(separator: true))
+        rows.append(PopupRow(text: "\(provider.symbol)  \(provider.name)", hero: true))
+        rows.append(PopupRow(text: aiUsage[provider.id]?.detail ?? "Loading…", dim: true))
+        if let reserve = aiUsage[provider.id]?.reserve {
+            rows.append(PopupRow(text: reserve.detail, highlight: true))
+        }
+        if provider.id == "claude" {
+            rows.append(PopupRow(text: "Fable scope only; general limits still apply", dim: true))
+        }
+        guard let usage = aiUsage[provider.id]?.usage else { continue }
+        for window in usage.windows {
+            let reset = window.resetDescription.isEmpty ? "" : " · \(window.resetDescription)"
+            rows.append(PopupRow(text: "\(window.title) \(window.usedPercent)% used\(reset)",
+                                 highlight: false))
+        }
+        if usage.resetCredits > 0 {
+            rows.append(PopupRow(text: "\(usage.resetCredits) reset credits available", dim: true))
+        }
     }
-    for summary in usage.paceSummaries {
-        rows.append(PopupRow(text: summary, dim: true))
-    }
-    if usage.resetCredits > 0 {
-        let noun = usage.resetCredits == 1 ? "credit" : "credits"
-        rows.append(PopupRow(text: "\(usage.resetCredits) reset \(noun) available"))
-    }
+    rows.append(PopupRow(separator: true))
+    rows.append(PopupRow(text: "refresh usage now", action: { updateCodexUsage() } ))
     rows.append(PopupRow(text: "open CodexBar dashboard…", dim: true, action: {
         NSWorkspace.shared.open(codexDashboardURL)
         closePopup()
@@ -3123,6 +3359,51 @@ final class BarView: NSView {
             drawMedia(at: mediaX, chipFont, iconFont)
             occupiedThrough = max(occupiedThrough, mediaX + mediaW)
         }
+
+        // On a notched MacBook the meeting pill sits LEFT of the notch so the
+        // Codex pill can keep the right strip; external / flat screens keep
+        // meeting in the right cluster.
+        let meetingLeftOfNotch = surface.notched
+        if meetingLeftOfNotch,
+           var meeting = rightItems["meeting"], meeting.drawing,
+           !(meeting.icon.isEmpty && meeting.label.isEmpty) {
+            let notchLeft: CGFloat = {
+                if let left = surface.screen.auxiliaryTopLeftArea {
+                    return left.maxX - surface.screen.frame.minX
+                }
+                return bounds.midX
+            }()
+            let budget = max(0, notchLeft - occupiedThrough - gap)
+            if let compact = meeting.compactLabel,
+               rightItemWidth("meeting", meeting, iconFont: iconFont, labelFont: chipFont) > budget {
+                meeting.label = compact
+            }
+            let width = rightItemWidth("meeting", meeting, iconFont: iconFont, labelFont: chipFont)
+            if width > 0, width <= budget {
+                let pill = NSRect(x: occupiedThrough + gap, y: (barHeight - pillHeight) / 2,
+                                  width: width, height: pillHeight)
+                palette.itemBG.setFill()
+                NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
+                let iconColor = meeting.iconColor ?? palette.label
+                let labelColor = meeting.labelColor ?? palette.label
+                let hasIcon = !meeting.icon.isEmpty
+                let hasLabel = !meeting.label.isEmpty
+                let iconInk = hasIcon ? inkBox(meeting.icon, iconFont).width : 0
+                let innerGap: CGFloat = hasIcon && hasLabel ? 7 : 0
+                if hasIcon {
+                    drawIcon(meeting.icon, iconFont, iconColor,
+                             centeredIn: NSRect(x: pill.minX + 10, y: pill.minY,
+                                                width: iconInk, height: pill.height))
+                }
+                if hasLabel {
+                    drawText(meeting.label, chipFont, labelColor,
+                             leftAt: pill.minX + 10 + iconInk + innerGap, midY: pill.midY)
+                }
+                itemRects.append(("meeting", NSRect(x: pill.minX, y: 0, width: width, height: barHeight)))
+                occupiedThrough = pill.maxX
+            }
+        }
+
         if surface.notched, let rightArea = surface.screen.auxiliaryTopRightArea {
             let notchRight = rightArea.minX - surface.screen.frame.minX
             occupiedThrough = max(occupiedThrough, notchRight)
@@ -3130,24 +3411,32 @@ final class BarView: NSView {
 
         // right cluster: laid out from the right edge inwards, so a pill
         // changing width never shifts the ones outside it
+        removeAllToolTips()
+        let builtinPanel = CGDisplayIsBuiltin(screenID(surface.screen)) != 0
         var cursor = bounds.maxX - padLeft
         for name in rightOrder.reversed() {
+            if meetingLeftOfNotch && name == "meeting" { continue }
+            if builtinPanel && builtinOmitRight.contains(name) { continue }
             guard var item = rightItems[name], item.drawing,
                   !(item.icon.isEmpty && item.label.isEmpty) else { continue }
             let labelFont = chipFont
 
             func measuredWidth(_ candidate: BarItem) -> CGFloat {
-                let iconInk = candidate.icon.isEmpty ? 0 : inkBox(candidate.icon, iconFont).width
-                let labelAdv = candidate.label.isEmpty ? 0 : advance(candidate.label, labelFont)
-                let innerGap: CGFloat = !candidate.icon.isEmpty && !candidate.label.isEmpty ? 7 : 0
-                return 10 + iconInk + innerGap + labelAdv + 10
+                rightItemWidth(name, candidate, iconFont: iconFont, labelFont: labelFont)
             }
 
             // Responsive items use their compact label before colliding with
             // media, the left cluster, or the notch on this display.
-            if let compact = item.compactLabel {
-                let budget = cursor - occupiedThrough - gap
+            // Codex is reserved: other pills compact/yield before it disappears.
+            if name != "codex", let compact = item.compactLabel {
+                let reserve: CGFloat = (rightItems["codex"]?.drawing == true
+                    && !(rightItems["codex"]?.icon.isEmpty == true && rightItems["codex"]?.label.isEmpty == true))
+                    ? 218 + gap : 0
+                let budget = cursor - occupiedThrough - gap - reserve
                 if measuredWidth(item) > budget { item.label = compact }
+                if measuredWidth(item) > budget { continue }
+            } else if name == "codex" {
+                let budget = cursor - occupiedThrough - gap
                 if measuredWidth(item) > budget { continue }
             }
 
@@ -3164,17 +3453,40 @@ final class BarView: NSView {
             let iconInk = hasIcon ? inkBox(item.icon, iconFont).width : 0
             let labelAdv = hasLabel ? advance(item.label, labelFont) : 0
             let innerGap: CGFloat = hasIcon && hasLabel ? 7 : 0
-            let width = 10 + iconInk + innerGap + labelAdv + 10
+            let width: CGFloat = name == "codex" ? 218 : 10 + iconInk + innerGap + labelAdv + 10
             let pill = NSRect(x: cursor - width, y: (barHeight - pillHeight) / 2,
                               width: width, height: pillHeight)
             palette.itemBG.setFill()
             NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
-            if hasIcon {
+            if name == "codex" {
+                for (index, provider) in aiProviders.enumerated() {
+                    let x = pill.minX + 10 + CGFloat(index) * 68
+                    let reserve = aiUsage[provider.id]?.reserve
+                    let stale = aiUsage[provider.id]?.stale == true
+                    let color = stale ? palette.label.withAlphaComponent(0.6) : reserve.map { $0.severity == 2 ? palette.red : ($0.severity == 1 ? palette.yellow : palette.green) }
+                        ?? palette.label.withAlphaComponent(0.45)
+                    drawText(provider.symbol, NSFont.systemFont(ofSize: 15, weight: .semibold), color,
+                             leftAt: x, midY: pill.midY)
+                    if stale {
+                        color.setFill()
+                        NSBezierPath(ovalIn: NSRect(x: x + 14, y: pill.midY + 5, width: 3, height: 3)).fill()
+                    }
+                    let text = reserve?.text ?? "—"
+                    drawText(text, NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), color,
+                             leftAt: x + 21, midY: pill.midY)
+                    if index < 2 {
+                        drawText("|", labelFont, palette.label.withAlphaComponent(0.2),
+                                 leftAt: x + 61, midY: pill.midY)
+                    }
+                }
+                addToolTip(pill, owner: self, userData: nil)
+            }
+            if hasIcon && name != "codex" {
                 drawIcon(item.icon, iconFont, iconColor,
                          centeredIn: NSRect(x: pill.minX + 10, y: pill.minY,
                                             width: iconInk, height: pill.height))
             }
-            if hasLabel {
+            if hasLabel && name != "codex" {
                 drawText(item.label, labelFont, labelColor,
                          leftAt: pill.minX + 10 + iconInk + innerGap, midY: pill.midY)
             }
@@ -3183,6 +3495,15 @@ final class BarView: NSView {
         }
     }
 
+
+    @objc func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag,
+                       point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
+        aiProviders.map { provider in
+            let value = aiUsage[provider.id]?.reserve?.detail
+                ?? aiUsage[provider.id]?.status ?? "Loading…"
+            return "\(provider.symbol) \(provider.name): \(value) · \(aiUsage[provider.id]?.detail ?? "Loading…")"
+        }.joined(separator: "\n") + "\nClick for limits, resets and connection settings."
+    }
 
     // Tracking areas, not a poll and not a global monitor: a global
     // monitor stops delivering once this app is itself active, which is

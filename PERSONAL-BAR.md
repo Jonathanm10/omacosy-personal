@@ -13,6 +13,94 @@ The build stays at `build/omacosy-bar.app`. The launch job is `com.omacosy.perso
 
 Activation archives any upstream `com.omacosy.bar.plist` under `~/.config/omacosy-personal/backups/launch-agents/`, unloads that job, and installs the personal job. It also makes `~/.local/bin/omacosy-update` point to `personal-bar/update-upstream`.
 
+## AI usage pill
+
+The shared pill is ordered **◎ Codex | ✳ Claude | ➤ Cursor**. It shows
+CodexBar's **pace reserve**, not quota remaining: **expected usage − actual usage**.
+`+13%` means 13 percentage points in reserve; `−16%` means 16 points in deficit;
+`0%` means CodexBar's **On pace** band (unrounded delta within ±2 points).
+Reserve/on-pace is green; deficits up to 6 points are amber, larger deficits red.
+Cached readings retain the dimmed-dot styling. Hover and click explain the scope:
+
+- **Codex weekly:** the HTTP service's `pace.secondary`, not model-specific windows
+  (including the unrelated `gpt-reserve` quota).
+- **Claude Fable weekly:** exact `claude-weekly-scoped-fable` window. The bar computes
+  CodexBar's weekly pace formula from its reset, 10,080-minute duration, and raw
+  usage. General Claude limits remain visible in the popup and can still constrain
+  Fable; they do not replace the requested scoped reserve.
+- **Cursor Third Party monthly:** the independent CLI's `pace.tertiary`, with its
+  matching tertiary usage window. Neither Cursor models nor Grok Bot is substituted.
+
+The supplied Codex/Cursor pace stage controls On pace; otherwise the signed delta
+is rounded as CodexBar does. Fable uses the current local calendar and the same
+`weeklyProgressWorkDays` key, checking `com.steipete.codexbar` then
+`com.steipete.codexbar.debug`. Unset (as verified locally) means seven-day linear
+progress. Values 2–6 count Monday through that ISO weekday, slicing at local day
+boundaries (including DST); other values use continuous progress. Fable follows
+the GUI's early-window gate (expected usage at least 3%, unless exhausted), and
+invalid/missing reset, duration, scoped window, or supplied pace shows unknown.
+The popup retains every raw usage limit and reset, explicitly labelled **used**.
+The three fixed-width segments stay together when the bar has room.
+On the built-in MacBook display, weather / Wi-Fi / Bluetooth / brightness
+are omitted so the Codex pill keeps its slot; external displays still show them.
+On a notched built-in, the meeting pill moves left of the notch so Codex can
+stay on the right strip.
+
+### Reserve source evidence
+
+Verified against CodexBar source commit
+[`08ef7710ff548cdd6b297db58cac6c42e47c19f6`](https://github.com/steipete/CodexBar/tree/08ef7710ff548cdd6b297db58cac6c42e47c19f6):
+
+- [`UsagePace.swift`](https://github.com/steipete/CodexBar/blob/08ef7710ff548cdd6b297db58cac6c42e47c19f6/Sources/CodexBarCore/UsagePace.swift):
+  `weekly`, `workdayProgress`, and `stage` define expected elapsed-cycle usage,
+  optional local workdays, actual-minus-expected delta, and the ±2 band.
+- [`UsagePaceText.swift`](https://github.com/steipete/CodexBar/blob/08ef7710ff548cdd6b297db58cac6c42e47c19f6/Sources/CodexBar/UsagePaceText.swift)
+  `detailLeftLabel` names negative deltas “in reserve” and positive ones “in deficit”.
+  [`MenuCardView+ModelHelpers.swift`](https://github.com/steipete/CodexBar/blob/08ef7710ff548cdd6b297db58cac6c42e47c19f6/Sources/CodexBar/MenuCardView%2BModelHelpers.swift)
+  `extraRateWindowPaceDetail` applies weekly pace to Claude scoped weekly windows.
+- [`CLIRenderer.swift`](https://github.com/steipete/CodexBar/blob/08ef7710ff548cdd6b297db58cac6c42e47c19f6/Sources/CodexBarCLI/CLIRenderer.swift)
+  `pacePayload` exports rounded delta plus stage; its `PaceComputation` comment
+  explicitly says CLI Codex pace omits the GUI's historical refinement. We use the
+  service/CLI's supplied pace, not a claim of full GUI historical-forecast parity.
+  [`CLIHelpers.swift`](https://github.com/steipete/CodexBar/blob/08ef7710ff548cdd6b297db58cac6c42e47c19f6/Sources/CodexBarCLI/CLIHelpers.swift)
+  establishes the GUI preference key/domain order (the bar does not inherit the
+  CLI process's own standard-defaults fallback).
+- [`docs/cursor.md`](https://github.com/steipete/CodexBar/blob/08ef7710ff548cdd6b297db58cac6c42e47c19f6/docs/cursor.md#snapshot-mapping)
+  names tertiary **Third Party**;
+  [`CursorStatusProbe.swift`](https://github.com/steipete/CodexBar/blob/08ef7710ff548cdd6b297db58cac6c42e47c19f6/Sources/CodexBarCore/Providers/Cursor/CursorStatusProbe.swift)
+  maps it from `apiPercentUsed` and the billing-cycle duration/end.
+
+Fresh sanitized September 8 checks confirmed HTTP `pace.secondary` and the exact
+Fable id; installed CLI/app version 0.56.6 exports `pace.tertiary` and the monthly
+tertiary window. The running HTTP service was not restarted. Source commit is an
+independent semantic reference, not an assertion that these installed binaries
+were built from that exact revision.
+
+A dash means unknown, never zero. CodexBar owns authentication: enable providers
+and sign in there (for Cursor, use **Add / switch account**). Missing providers,
+connection errors without a previous reading, and snapshots at least one hour old
+show a dash. Readings at least five minutes old, or retained after a failed refresh,
+are dimmed with a dot beside the icon. Hover and popup show cached status and the
+provider timestamp. Each provider retains its last-known reading independently,
+for at most one hour from that timestamp. Usage refreshes every minute; the popup
+also offers **refresh usage now**. Codex and Claude reread the local HTTP service's
+cache. Cursor runs `/opt/homebrew/bin/codexbar usage --provider cursor --json`
+on a background queue, with a 30-second deadline and 1 MiB output cap. The old
+HTTP service cannot see the current Cursor login, while the installed CLI can.
+The service remains running unchanged so Codex and Claude keep working. Each
+source updates only its own providers. With multiple accounts, the newest usable
+snapshot is selected, skipping failed accounts; values are not summed.
+
+Run the synthetic parser and refresh-sequence checks without launching the bar:
+
+```sh
+./personal-bar/test-usage
+```
+
+Add `--live-cursor` to verify the actual CLI retrieval and production parser using
+current authentication. The test prints only the resulting reserve, not account
+identities or credentials.
+
 ## Updating
 
 Run the usual command:

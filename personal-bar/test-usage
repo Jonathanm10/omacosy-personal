@@ -1,0 +1,12 @@
+#!/bin/bash
+# Compile the production Foundation-only parser with synthetic fixtures.
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+TEMP="$(mktemp -d)"
+trap 'rm -rf "$TEMP"' EXIT
+printf 'import Foundation\nimport CoreFoundation\nimport Darwin\n' > "$TEMP/main.swift"
+sed -n '/^\/\/ BEGIN AI USAGE MODEL/,/^\/\/ END AI USAGE MODEL/p' "$REPO/helper/bar.swift" >> "$TEMP/main.swift"
+sed -n '/^\/\/ BEGIN CURSOR CLI/,/^\/\/ END CURSOR CLI/p' "$REPO/helper/bar.swift" >> "$TEMP/main.swift"
+cat "$REPO/personal-bar/tests/usage.swift" >> "$TEMP/main.swift"
+swiftc "$TEMP/main.swift" -o "$TEMP/test-usage"
+"$TEMP/test-usage" "$@"

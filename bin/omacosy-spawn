@@ -15,6 +15,45 @@
 APP="$1"
 [ -n "$APP" ] || exit 1
 
+# A new Ghostty window can come from the instance that is already
+# running. `open -na` is a whole second app instance every time, a full
+# app launch, while Ghostty 1.3's scripting dictionary hands a window
+# over from the one already warm. Time from the key to a window the WM
+# can see: ~140 ms against ~300 ms on the author's Mac; ~225 ms against
+# ~810 ms measured here through OmniWM's window count. The instance
+# count is the other half — three spawns through open(1) left three more
+# ghostty processes behind, the dictionary path none. Ghostty is the
+# terminal this repo ships and Super+Enter is the most pressed chord in
+# the map, so it earns the special case.
+#
+# Everything else, and a Ghostty that is not running yet, goes through
+# open(1): addressing an app that is down would launch it AND let it
+# open its own initial window, which is two windows for one press.
+# Ghostty before 1.3 has no dictionary and raises, landing there too.
+# The directory is pinned to $HOME because that is where open(1) starts
+# one; inheriting the focused window's directory would be a behaviour
+# change riding along with a speed-up.
+# The name is matched literally, so a renamed Ghostty bundle simply
+# takes the open(1) path — slower, never wrong.
+#
+# `with timeout` because this runs while the spawn lock is HELD: an
+# Apple event to a wedged app waits two minutes by default, which would
+# take the terminal key down with it. Five seconds, then the error lands
+# in the same fallback as a missing dictionary.
+spawn_app() {
+  if [ "$1" = Ghostty ] && /usr/bin/osascript \
+    -e 'if application "Ghostty" is running then' \
+    -e 'with timeout of 5 seconds' \
+    -e "tell application \"Ghostty\" to new window with configuration {initial working directory:\"$HOME\"}" \
+    -e 'end timeout' \
+    -e 'else' \
+    -e 'error "Ghostty is not running"' \
+    -e 'end if' >/dev/null 2>&1; then
+    return 0
+  fi
+  open -na "$1"
+}
+
 # macOS ships no flock; mkdir is the portable atomic lock. Both WM
 # paths need the same serialization, so it is taken ONCE here. A
 # holder that died is stolen after ~5s so the terminal key can never
@@ -56,7 +95,7 @@ if wm_is_omniwm; then
   # never shows a window cannot wedge the terminal key.
   "$OMNI" wait-window "$before" 2000 >/dev/null 2>&1 &
   waiter=$!
-  open -na "$APP"
+  spawn_app "$APP"
   wait "$waiter" 2>/dev/null || true
   exit 0
 fi
@@ -66,7 +105,7 @@ STATE="/tmp/omacosy-split-state-$(id -u)"
 
 prev=0
 [ -f "$STATE" ] && prev=$(cut -d' ' -f1 "$STATE")
-open -na "$APP"
+spawn_app "$APP"
 for _ in $(seq 40); do
   cur=0
   [ -f "$STATE" ] && cur=$(cut -d' ' -f1 "$STATE")

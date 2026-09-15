@@ -45,10 +45,18 @@ while IFS= read -r f; do BACKGROUNDS+=("$f"); done < <(
 )
 [ "${#BACKGROUNDS[@]}" -gt 0 ] || { echo "theme has no backgrounds" >&2; exit 1; }
 
-CURRENT="$(readlink "$LINK" 2>/dev/null || true)"
+# -ef, not =. The link and this list name the same file two different
+# ways. theme-set writes the resolved path under themes/<name>/, this
+# list is built from find under the current-theme SYMLINK, and the
+# argument form above writes a third spelling. A string compare matched
+# none of them, so the loop fell through and NEXT stayed at the first
+# image: the first Super+Shift+B after a theme change re-set the picture
+# already on screen. -ef compares the inode the two paths reach, so
+# every spelling of one file matches. A missing or dangling link is
+# false and keeps the fallback, which is what the old readlink guard did.
 NEXT="${BACKGROUNDS[0]}"
 for i in "${!BACKGROUNDS[@]}"; do
-  if [ "${BACKGROUNDS[$i]}" = "$CURRENT" ]; then
+  if [ "${BACKGROUNDS[$i]}" -ef "$LINK" ]; then
     NEXT="${BACKGROUNDS[$(( (i + 1) % ${#BACKGROUNDS[@]} ))]}"
     break
   fi

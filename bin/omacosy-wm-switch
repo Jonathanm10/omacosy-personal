@@ -44,7 +44,14 @@ start_aerospace_world() {
   REPO="$(cd "$(dirname "$(readlink "$HOME/.local/bin/omacosy-wm-switch" || echo "$0")")/.." && pwd)"
   cp "$REPO/config/gesture/config.json" "$HOME/.config/omacosy/gesture.json" 2>/dev/null || true
   launchctl load "$HOME/Library/LaunchAgents/com.omacosy.ffm.plist" 2>/dev/null || true
+  # load, THEN kickstart. `load` bootstraps a service that was booted out, but
+  # on one already loaded it fails with "Input/output error" and leaves the
+  # process untouched — so the gesture.json copied just above is never read and
+  # the daemon keeps the other manager's swipe commands in memory. `kickstart`
+  # alone cannot replace it: on a booted-out service it answers "Could not find
+  # service". Both, in this order, cover both states.
   launchctl load "$HOME/Library/LaunchAgents/com.omacosy.gesture.plist" 2>/dev/null || true
+  launchctl kickstart -k "gui/$(id -u)/com.omacosy.gesture" 2>/dev/null || true
 }
 
 stop_aerospace_world() {
@@ -99,7 +106,10 @@ omniwm)
   # gesture cannot work — Esc, click or selecting closes it.
   REPO="$(cd "$(dirname "$(readlink "$HOME/.local/bin/omacosy-wm-switch" || echo "$0")")/.." && pwd)"
   cp "$REPO/config/gesture/config.omniwm.json" "$HOME/.config/omacosy/gesture.json" 2>/dev/null || true
+  # see start_aerospace_world: the daemon reads gesture.json once, at startup,
+  # so the copy above needs a real restart and not just a bootstrap
   launchctl load "$HOME/Library/LaunchAgents/com.omacosy.gesture.plist" 2>/dev/null || true
+  launchctl kickstart -k "gui/$(id -u)/com.omacosy.gesture" 2>/dev/null || true
   echo
   echo "  VERIFY NOW: switch workspaces with Super+1 and Super+2."
   echo "  Type 'yes' within 90 seconds if it works."

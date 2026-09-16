@@ -273,7 +273,7 @@ cp "$REPO_DIR/config/borders.conf" "$HOME/.config/omacosy/borders.conf"
 # app choices, RESOLVED (apps.local.conf already applied), for the same
 # reason: the bar's activity pill launches $TERMINAL and cannot read the
 # repo from a launchd agent when the clone is TCC-protected
-printf 'TERMINAL=%s\nBROWSER=%s\nMUSIC=%s\nMESSENGER=%s\n' \
+printf 'TERMINAL="%s"\nBROWSER="%s"\nMUSIC="%s"\nMESSENGER="%s"\n' \
   "$TERMINAL" "$BROWSER" "$MUSIC" "$MESSENGER" > "$HOME/.config/omacosy/apps.conf"
 
 cat > "$HOME/Library/LaunchAgents/com.omacosy.borders.plist" <<PLIST

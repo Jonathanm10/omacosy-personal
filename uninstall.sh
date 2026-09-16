@@ -147,13 +147,6 @@ else
   rmdir "$HOME/.config/karabiner" 2>/dev/null || true
 fi
 
-# Pre-omacosy, ~/.zshrc pointed at the old dotbot repo — relink if
-# nothing else restored it and that repo is still around.
-if [ ! -e "$HOME/.zshrc" ] && [ -f "$HOME/Documents/config/.dotfiles/zshrc" ]; then
-  log "Relinking ~/.zshrc to the legacy dotfiles repo"
-  ln -s "$HOME/Documents/config/.dotfiles/zshrc" "$HOME/.zshrc"
-fi
-
 # theme-set / theme-next out of ~/.local/bin — only when they are OUR
 # symlinks (a user's own script of the same name survives)
 for t in theme-set theme-next theme-bg-next omacosy-ws omacosy-toggle omacosy-focus-guard omacosy-ws-collapse omacosy-float omacosy-cycle omacosy-update omacosy-spawn omacosy-layout omacosy-wm-switch omacosy-karabiner-omniwm; do

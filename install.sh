@@ -163,7 +163,7 @@ if [ -f "$HOME/.config/karabiner/karabiner.json" ] \
   mark "had-karabiner-config"
 fi
 cp "$REPO_DIR/config/karabiner/karabiner.json" "$HOME/.config/karabiner/karabiner.json"
-launchctl kickstart -k "gui/$(id -u)/org.pqrs.service.agent.karabiner_console_user_server" 2>/dev/null || true
+launchctl kickstart -k "gui/$(id -u)/org.pqrs.service.agent.Karabiner-Console-User-Server" 2>/dev/null || true
 # Karabiner's Menu and NotificationWindow helpers are disabled the
 # SUPPORTED way in karabiner.json (global.show_in_menu_bar and
 # global.enable_notification_window, both false) — the bootout below
@@ -487,7 +487,7 @@ sleep 1
 # the settings window, and it costs ~92MB resident to leave open. Launch
 # it only when the service is not already up — i.e. a first run, where it
 # is needed to approve the driver extension.
-if launchctl list 2>/dev/null | grep -q org.pqrs.service.agent.karabiner_console_user_server; then
+if launchctl list 2>/dev/null | grep -qiE 'karabiner[-_]console[-_]user[-_]server'; then
   log "Karabiner already running (Caps Lock -> Super)"
 else
   log "Starting Karabiner-Elements (approve its driver extension, then quit the app)"

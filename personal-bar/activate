@@ -38,7 +38,10 @@ cat > "$PLIST_TEMP" <<PLIST
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>EnvironmentVariables</key>
-  <dict><key>OMACOSY_MANAGED</key><string>1</string></dict>
+  <dict>
+    <key>OMACOSY_MANAGED</key><string>1</string>
+    <key>OMACOSY_BAR_LOCAL_CONF</key><string>$REPO/config/bar.local.conf</string>
+  </dict>
   <key>StandardErrorPath</key><string>/tmp/omacosy-personal-bar.err</string>
 </dict>
 </plist>

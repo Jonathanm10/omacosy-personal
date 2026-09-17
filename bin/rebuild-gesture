@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# rebuild-gesture — compile, sign, and restart omacosy-gesture without
+# stranding Accessibility / Input Monitoring grants.
+#
+# Prefer this over a raw clang + codesign. The generic "Apple Development"
+# label is ambiguous on this machine; we reuse the exact Authority that
+# already signed the gesture app (or the personal bar). Never use
+# --options runtime: MultitouchSupport + HID taps break under it.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+G="$REPO/helper/gesture"
+GESTURE_APP="${OMACOSY_GESTURE_APP:-$HOME/.local/share/omacosy/omacosy-gesture.app}"
+GESTURE_BIN="$GESTURE_APP/Contents/MacOS/omacosy-gesture"
+PLIST="$HOME/Library/LaunchAgents/com.omacosy.gesture.plist"
+LOG=/tmp/omacosy-gesture.log
+LABEL="gui/$(id -u)/com.omacosy.gesture"
+
+resolve_identity() {
+  local id="${OMACOSY_SIGNING_IDENTITY:-}" existing
+  if [ -z "$id" ]; then
+    for existing in "$GESTURE_APP" \
+      "$REPO/build/omacosy-bar.app" \
+      "$HOME/.local/share/omacosy/omacosy-bar.app"; do
+      if [ -e "$existing" ]; then
+        id="$(codesign -dvv "$existing" 2>&1 \
+          | sed -n 's/^Authority=\(Apple Development:.*\)$/\1/p' | head -1)"
+        [ -n "$id" ] && break
+      fi
+    done
+  fi
+  if [ -z "$id" ] \
+    || ! security find-identity -p codesigning -v 2>/dev/null | grep -Fq "\"$id\""; then
+    echo "rebuild-gesture: no usable Apple Development identity" >&2
+    echo "  set OMACOSY_SIGNING_IDENTITY='Apple Development: …' and retry" >&2
+    exit 1
+  fi
+  printf '%s' "$id"
+}
+
+stop_daemon() {
+  launchctl bootout "$LABEL" 2>/dev/null || true
+  launchctl unload "$PLIST" 2>/dev/null || true
+  pkill -x omacosy-gesture 2>/dev/null || true
+  # lockfile can linger after SIGKILL and block the next acquire
+  rm -f "/tmp/omacosy-gesture-${USER:-$(id -un)}.lock" 2>/dev/null || true
+  sleep 0.3
+}
+
+build() {
+  mkdir -p "$GESTURE_APP/Contents/MacOS"
+  clang -std=c99 -O3 -fobjc-arc -arch arm64 \
+    -Wno-pointer-integer-compare \
+    -Wno-incompatible-pointer-types-discards-qualifiers \
+    -Wno-absolute-value \
+    -o "$GESTURE_BIN" \
+    "$G/aerospace.c" "$G/omniwm.c" "$G/yyjson.c" "$G/haptic.c" \
+    "$G/event_tap.m" "$G/main.m" \
+    -framework CoreFoundation -framework IOKit \
+    -F/System/Library/PrivateFrameworks -framework MultitouchSupport \
+    -framework ApplicationServices -framework Cocoa -ldl
+  cp "$G/gesture-info.plist" "$GESTURE_APP/Contents/Info.plist"
+  printf 'APPL????' > "$GESTURE_APP/Contents/PkgInfo"
+}
+
+sign() {
+  local id="$1"
+  # no --options runtime — private MultitouchSupport + event taps need the
+  # looser default; Accessibility entitlement is enough for TCC identity
+  codesign -f -s "$id" --identifier com.omacosy.gesture \
+    --entitlements "$G/accessibility.entitlements" "$GESTURE_APP"
+  codesign --verify --deep --strict "$GESTURE_APP"
+  codesign -dv "$GESTURE_APP" 2>&1 | sed -n 's/^/  /p' \
+    | grep -E 'Identifier|TeamIdentifier|Authority=' | head -5
+}
+
+start_daemon() {
+  if [ ! -f "$PLIST" ]; then
+    cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.omacosy.gesture</string>
+  <key>ProgramArguments</key><array><string>$GESTURE_BIN</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+</dict></plist>
+PLIST
+  fi
+  : > "$LOG"
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
+    || launchctl load "$PLIST" 2>/dev/null \
+    || launchctl kickstart -k "$LABEL" 2>/dev/null \
+    || true
+}
+
+verify() {
+  # aerospace_new can block ~30s when AeroSpace is down (OmniWM desk)
+  local i line
+  for i in $(seq 1 45); do
+    if grep -q "Waiting for accessibility" "$LOG" 2>/dev/null \
+      && ! grep -q "Accessibility permission granted. Continuing" "$LOG" 2>/dev/null; then
+      echo "rebuild-gesture: still waiting on Accessibility" >&2
+      echo "  System Settings → Privacy & Security → Accessibility → enable omacosy-gesture" >&2
+      echo "  (and Input Monitoring if prompted). Then: launchctl kickstart -k $LABEL" >&2
+      return 1
+    fi
+    if grep -q "Raw multitouch detection active" "$LOG" 2>/dev/null; then
+      echo "rebuild-gesture: ok"
+      grep -E "Loaded config|Option\+scroll|Raw multitouch|super_scroll_stack" "$LOG" \
+        | sed 's/^/  /' | tail -6
+      return 0
+    fi
+    sleep 1
+  done
+  echo "rebuild-gesture: timed out waiting for ready log" >&2
+  echo "--- last log lines ---" >&2
+  tail -15 "$LOG" >&2 || true
+  return 1
+}
+
+IDENTITY="$(resolve_identity)"
+echo "rebuild-gesture: signing as $IDENTITY"
+stop_daemon
+build
+sign "$IDENTITY"
+start_daemon
+verify

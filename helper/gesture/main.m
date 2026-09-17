@@ -20,7 +20,10 @@
 #include "haptic.h"
 #include <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
+#include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
+#include <unistd.h>
 #include <IOKit/IOKitLib.h>
 
 static aerospace* g_aerospace = NULL;
@@ -757,6 +760,109 @@ static void acquire_lockfile(void)
 	}
 }
 
+// --- Left Option + scroll → OmniWM stack/tab focus ---------------------
+// Karabiner cannot take scroll as a from-event (Elements issue #1362).
+// This machine's OmniWM "Super" is Left Option (focus.up/down =
+// Left Option+↑/↓), so Option+wheel fires the same focus commands —
+// walks Dwindle groups and Niri tabbed columns before edge fallback.
+// Option+Shift is left alone (OmniWM's Niri column-scroll chord).
+static CFMachPortRef g_scroll_tap = NULL;
+static CFRunLoopSourceRef g_scroll_src = NULL;
+static double g_scroll_accum = 0;
+static CFAbsoluteTime g_scroll_last_fire = 0;
+
+static void fire_stack_focus(int dir) // +1 = up, -1 = down
+{
+	stamp_user_intent();
+	dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+		pthread_mutex_lock(&g_omni_lock);
+		if (!g_omni)
+			g_omni = omniwm_new();
+		bool ok = false;
+		if (g_omni) {
+			const char* args = dir > 0 ? "{\"direction\":\"up\"}" : "{\"direction\":\"down\"}";
+			ok = omniwm_command(g_omni, "focus", args);
+			if (!ok) {
+				// socket went stale mid-session — drop and retry once
+				omniwm_close(g_omni);
+				g_omni = omniwm_new();
+				if (g_omni)
+					ok = omniwm_command(g_omni, "focus", args);
+			}
+		}
+		pthread_mutex_unlock(&g_omni_lock);
+		if (!ok)
+			fprintf(stderr, "option-scroll: focus %s failed\n", dir > 0 ? "up" : "down");
+	});
+}
+
+static CGEventRef option_scroll_callback(CGEventTapProxy proxy, CGEventType type,
+	CGEventRef event, void* refcon)
+{
+	(void)proxy;
+	(void)refcon;
+	if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+		if (g_scroll_tap)
+			CGEventTapEnable(g_scroll_tap, true);
+		return event;
+	}
+	if (type != kCGEventScrollWheel)
+		return event;
+
+	CGEventFlags flags = CGEventGetFlags(event);
+	// Left Option alone — same chord family as focus.up/down. Skip if
+	// Shift/Cmd/Ctrl are down (Option+Shift = Niri column scroll;
+	// Right Option is unbound here — used for other Karabiner tricks).
+	if (!(flags & kCGEventFlagMaskAlternate))
+		return event;
+	if (flags & (kCGEventFlagMaskShift | kCGEventFlagMaskCommand | kCGEventFlagMaskControl))
+		return event;
+	bool left_opt = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, kVK_Option);
+	bool right_opt = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, kVK_RightOption);
+	if (!left_opt || right_opt)
+		return event;
+
+	int64_t discrete = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1);
+	double continuous = CGEventGetDoubleValueField(event, kCGScrollWheelEventPointDeltaAxis1);
+	bool is_continuous = CGEventGetIntegerValueField(event, kCGScrollWheelEventIsContinuous) != 0;
+	double delta = is_continuous ? continuous : (double)discrete;
+	if (delta == 0)
+		return NULL; // still consume zero-delta momentum crumbs while Option held
+
+	g_scroll_accum += delta;
+	double notch = is_continuous ? 8.0 : 1.0;
+	CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+	// ~12 Hz ceiling keeps a flick from racing through the whole stack
+	if (fabs(g_scroll_accum) >= notch && (now - g_scroll_last_fire) > 0.08) {
+		int dir = g_scroll_accum > 0 ? 1 : -1;
+		g_scroll_accum = 0;
+		g_scroll_last_fire = now;
+		fire_stack_focus(dir);
+	}
+	return NULL; // swallow — otherwise the focused app also scrolls
+}
+
+static bool begin_super_scroll_tap(void)
+{
+	CGEventMask mask = CGEventMaskBit(kCGEventScrollWheel);
+	g_scroll_tap = CGEventTapCreate(
+		kCGHIDEventTap,
+		kCGHeadInsertEventTap,
+		kCGEventTapOptionDefault, // must consume, not listen-only
+		mask,
+		option_scroll_callback,
+		NULL);
+	if (!g_scroll_tap) {
+		fprintf(stderr, "Error: Option+scroll event tap failed (Accessibility / Input Monitoring?).\n");
+		return false;
+	}
+	g_scroll_src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, g_scroll_tap, 0);
+	CFRunLoopAddSource(CFRunLoopGetMain(), g_scroll_src, kCFRunLoopCommonModes);
+	CGEventTapEnable(g_scroll_tap, true);
+	NSLog(@"Left Option+scroll stack focus enabled.");
+	return true;
+}
+
 void waitForAccessibilityAndRestart(void)
 {
 	while (!AXIsProcessTrusted()) {
@@ -795,7 +901,7 @@ int main(int argc, const char* argv[])
 		NSLog(@"Accessibility permission granted. Continuing app initialization...");
 
 		g_config = load_config();
-		NSLog(@"Loaded config: fingers=%d, skip_empty=%s, wrap_around=%s, haptic=%s, swipe_left='%s', swipe_right='%s', swipe_up='%s', swipe_down='%s'",
+		NSLog(@"Loaded config: fingers=%d, skip_empty=%s, wrap_around=%s, haptic=%s, swipe_left='%s', swipe_right='%s', swipe_up='%s', swipe_down='%s', super_scroll_stack=%s",
 			g_config.fingers,
 			g_config.skip_empty ? "YES" : "NO",
 			g_config.wrap_around ? "YES" : "NO",
@@ -803,7 +909,8 @@ int main(int argc, const char* argv[])
 			g_config.swipe_left,
 			g_config.swipe_right,
 			g_config.swipe_up,
-			g_config.swipe_down);
+			g_config.swipe_down,
+			g_config.super_scroll_stack ? "YES" : "NO");
 
 		g_aerospace = aerospace_new(NULL);
 		if (!g_aerospace) {
@@ -825,6 +932,9 @@ int main(int argc, const char* argv[])
 		// (this prompts on first run) and a running run loop, which
 		// NSApplicationMain provides below.
 		IOHIDRequestAccess(kIOHIDRequestTypeListenEvent);
+
+		if (g_config.super_scroll_stack)
+			begin_super_scroll_tap();
 
 		if (!register_new_devices()) {
 			fprintf(stderr, "Error: no multitouch devices found.\n");

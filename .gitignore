@@ -4,4 +4,5 @@
 /omacosy-gesture.app/
 /build/
 config/apps.local.conf
+config/bar.local.conf
 config/aerospace/aerospace.toml

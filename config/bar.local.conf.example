@@ -1,0 +1,10 @@
+# Personal bar overrides. Copy to bar.local.conf (gitignored) or to
+# ~/.config/omacosy-personal/bar.local.conf. Never commit the copy —
+# calendar titles are desk-specific.
+#
+# Comma-separated exact Calendar.app titles. When set, only those editable
+# calendars feed the meeting pill. Omit the key (or leave the file absent)
+# to include every editable calendar. Event bodies never leave EventKit /
+# never enter git either way.
+#
+# CALENDAR_TITLES=Work,Personal

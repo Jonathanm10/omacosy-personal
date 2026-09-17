@@ -92,28 +92,46 @@ let cursorCLI = Data("""
 let connected = reduceAIUsage(previous: initial, data: cursorCLI, now: now, providerIDs: ["cursor"])
 assert(connected["cursor"]?.usage?.windows.map(\.usedPercent).max() == 40)
 assert(connected["codex"] == initial["codex"] && connected["claude"] == initial["claude"])
-let httpAfterCLI = reduceAIUsage(previous: connected, data: sequenceData, now: now, providerIDs: ["codex", "claude"])
-assert(httpAfterCLI["cursor"] == connected["cursor"])
-let cliFailure = reduceAIUsage(previous: httpAfterCLI, data: nil, now: now.addingTimeInterval(60), providerIDs: ["cursor"])
+let othersAfterCursor = reduceAIUsage(previous: connected, data: sequenceData, now: now, providerIDs: ["codex", "claude"])
+assert(othersAfterCursor["cursor"] == connected["cursor"])
+let cliFailure = reduceAIUsage(previous: othersAfterCursor, data: nil, now: now.addingTimeInterval(60), providerIDs: ["cursor"])
 assert(cliFailure["cursor"]?.usage?.windows.map(\.usedPercent).max() == 40 && cliFailure["cursor"]?.stale == true)
-assert(cliFailure["codex"] == httpAfterCLI["codex"])
-print("Cursor source merge passed: CLI success, HTTP isolation, CLI outage retention")
-let echoed = cursorCLIUsage(executable: "/bin/echo", arguments: ["ok"])
+assert(cliFailure["codex"] == othersAfterCursor["codex"])
+let fullCLI = Data("""
+[{"provider":"codex","usage":{"updatedAt":"2026-09-08T12:00:00Z","primary":{"usedPercent":11},"secondary":{"usedPercent":22}}},
+ {"provider":"claude","usage":{"updatedAt":"2026-09-08T12:00:00Z","primary":{"usedPercent":18}}},
+ {"provider":"cursor","usage":{"updatedAt":"2026-09-08T12:00:00Z","tertiary":{"usedPercent":41}}}]
+""".utf8)
+let unified = reduceAIUsage(previous: cliFailure, data: fullCLI, now: now)
+assert(unified["codex"]?.usage?.windows.map(\.usedPercent).max() == 22)
+assert(unified["claude"]?.usage?.windows.map(\.usedPercent).max() == 18)
+assert(unified["cursor"]?.usage?.windows.map(\.usedPercent).max() == 41)
+let unifiedOutage = reduceAIUsage(previous: unified, data: nil, now: now.addingTimeInterval(60))
+assert(unifiedOutage.values.allSatisfy { $0.stale == true })
+assert(unifiedOutage["codex"]?.usage?.windows.map(\.usedPercent).max() == 22)
+print("CLI source merge passed: partial provider updates, full usage payload, outage retention")
+let echoed = codexbarCLIUsage(executable: "/bin/echo", arguments: ["ok"])
 assert(echoed == Data("ok\n".utf8))
-assert(cursorCLIUsage(executable: "/usr/bin/false", arguments: []) == nil)
-assert(cursorCLIUsage(executable: "/missing/codexbar", arguments: []) == nil)
+assert(codexbarCLIUsage(executable: "/usr/bin/false", arguments: []) == nil)
+assert(codexbarCLIUsage(executable: "/missing/codexbar", arguments: []) == nil)
 let started = ProcessInfo.processInfo.systemUptime
-assert(cursorCLIUsage(executable: "/bin/sleep", arguments: ["5"], timeout: 0.1) == nil)
+assert(codexbarCLIUsage(executable: "/bin/sleep", arguments: ["5"], timeout: 0.1) == nil)
 assert(ProcessInfo.processInfo.systemUptime - started < 1)
-assert(cursorCLIUsage(executable: "/usr/bin/yes", arguments: [], outputLimit: 1024) == nil)
-print("Cursor process passed: success, exit failure, missing executable, bounded timeout/output")
-if CommandLine.arguments.contains("--live-cursor") {
-    let live = reduceAIUsage(previous: [:], data: cursorCLIUsage(), now: Date(), providerIDs: ["cursor"])
-    guard let reserve = live["cursor"]?.reserve else {
-        print("FAIL: live production Cursor retrieval has no reserve")
-        exit(1)
+assert(codexbarCLIUsage(executable: "/usr/bin/yes", arguments: [], outputLimit: 1024) == nil)
+print("CodexBar process passed: success, exit failure, missing executable, bounded timeout/output")
+if CommandLine.arguments.contains("--live") || CommandLine.arguments.contains("--live-cursor") {
+    let liveNow = Date()
+    let live = reduceAIUsage(previous: [:], data: codexbarCLIUsage(), now: liveNow)
+    for provider in aiProviders {
+        guard let reserve = live[provider.id]?.reserve else {
+            print("FAIL: live production \(provider.name) retrieval has no reserve")
+            exit(1)
+        }
+        let horizon = reserve.horizon(now: liveNow)
+        let pill = horizon.map { "\(reserve.figure) \($0.tag)" } ?? reserve.figure
+        let phrase = horizon.map { " · \($0.phrase)" } ?? ""
+        print("Live production \(provider.name) retrieval PASS: \(reserve.detail)\(phrase) · pill \(pill)")
     }
-    print("Live production Cursor retrieval PASS: \(reserve.detail)")
 }
 
 // Reserve checks use the real parser without adding synthetic fields to live payloads.
@@ -128,12 +146,19 @@ assert(reserves["claude"]?.reserve?.percent == 34)
 assert(reserves["cursor"]?.reserve?.percent == 13)
 assert(reserves["codex"]?.reserve?.text == "-16%")
 assert(reserves["cursor"]?.reserve?.text == "+13%")
+assert(reserves["codex"]?.reserve?.figure == "-16")
+assert(reserves["cursor"]?.reserve?.figure == "+13")
+assert(reserves["claude"]?.reserve?.figure == "+34")
+assert(reserves["claude"]?.reserve?.resetsAt == aiUsageDate("2026-09-12T00:00:00Z"))
+assert(reserves["codex"]?.reserve?.resetsAt == nil)
+assert(reserves["cursor"]?.reserve?.resetsAt == nil)
 assert(reserves["claude"]?.reserve?.detail == "Fable weekly · 34% in reserve")
 assert(reserves["codex"]?.reserve?.severity == 2)
 assert(reserves["cursor"]?.reserve?.severity == 0)
 assert(AIReserve(percent: -6, scope: "test").severity == 1)
 assert(AIReserve(percent: 0, scope: "test").detail == "test · On pace")
 assert(AIReserve(percent: 0, scope: "test").text == "0%")
+assert(AIReserve(percent: 0, scope: "test").figure == "0")
 assert(states["codex"]?.reserve == nil) // Never fall back to usage or an unrelated model's "reserve".
 assert(states["claude"]?.reserve == nil) // Never use general Claude in place of Fable.
 let reserveOutage = reduceAIUsage(previous: reserves, data: nil, now: now.addingTimeInterval(420))
@@ -169,6 +194,37 @@ assert(fable(0, days: 5)?.percent == 30) // Mon + half Tue / five workdays.
 assert(fable(0, days: 2)?.percent == 75)
 assert(fable(0, days: 7)?.percent == 50)
 assert(fable(0, days: 1)?.percent == 50) // Source ignores values outside 2..<7.
+assert(fable(48)?.resetsAt == aiUsageDate("2026-09-12T00:00:00Z"))
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-08T18:00:00Z")!, calendar: utc) == .today)
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-08T18:00:00Z")!, calendar: utc)?.tag == "0")
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-08T18:00:00Z")!, calendar: utc)?.phrase == "resets today")
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-09T01:00:00Z")!, calendar: utc) == .tomorrow)
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-09T01:00:00Z")!, calendar: utc)?.tag == "t")
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-09T01:00:00Z")!, calendar: utc)?.phrase == "resets tomorrow")
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-11T00:00:00Z")!, calendar: utc) == .days(3))
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-11T00:00:00Z")!, calendar: utc)?.tag == "3")
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-11T00:00:00Z")!, calendar: utc)?.phrase == "resets in 3 days")
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-17T00:00:00Z")!, calendar: utc) == .days(9))
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-17T00:00:00Z")!, calendar: utc)?.tag == "9")
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-18T00:00:00Z")!, calendar: utc) == .weeks(2))
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-18T00:00:00Z")!, calendar: utc)?.tag == "w")
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-18T00:00:00Z")!, calendar: utc)?.phrase == "resets within 2 weeks")
+assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-23T00:00:00Z")!, calendar: utc) == .weeks(3))
+assert(ResetHorizon(from: now, to: now, calendar: utc) == nil)
+assert(ResetHorizon(from: now, to: now.addingTimeInterval(-60), calendar: utc) == nil)
+assert(reserves["claude"]?.reserve?.horizon(now: now, calendar: utc) == .days(4))
+assert(reserves["claude"]?.reserve?.horizon(now: now, calendar: utc)?.tag == "4")
+assert(reserveOutage["claude"]?.reserve?.resetsAt == reserves["claude"]?.reserve?.resetsAt)
+assert(reserveOutage["claude"]?.reserve?.horizon(now: now.addingTimeInterval(420), calendar: utc) == .days(4))
+assert(reserveOutage["claude"]?.reserve?.horizon(now: now.addingTimeInterval(3 * 24 * 3600), calendar: utc) == .tomorrow)
+let scopedResets = parseAIUsage(Data("""
+[{"provider":"codex","pace":{"secondary":{"deltaPercent":5,"stage":"ahead"}},"usage":{"updatedAt":"2026-09-08T12:00:00Z","secondary":{"usedPercent":10,"resetsAt":"2026-09-09T18:00:00Z"}}},
+ {"provider":"cursor","pace":{"tertiary":{"deltaPercent":-8,"stage":"behind"}},"usage":{"updatedAt":"2026-09-08T12:00:00Z","tertiary":{"usedPercent":20,"resetsAt":"2026-09-10T08:00:00Z"}}}]
+""".utf8), now: now, workDays: nil)!
+assert(scopedResets["codex"]?.reserve?.resetsAt == aiUsageDate("2026-09-09T18:00:00Z"))
+assert(scopedResets["cursor"]?.reserve?.resetsAt == aiUsageDate("2026-09-10T08:00:00Z"))
+assert(scopedResets["codex"]?.reserve?.horizon(now: now, calendar: utc) == .tomorrow)
+assert(scopedResets["cursor"]?.reserve?.horizon(now: now, calendar: utc) == .days(2))
 var zurich = Calendar(identifier: .gregorian)
 zurich.timeZone = TimeZone(identifier: "Europe/Zurich")!
 let dstNow = aiUsageDate("2026-03-30T10:00:00Z")!

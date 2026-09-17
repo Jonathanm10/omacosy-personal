@@ -104,7 +104,7 @@ func aerospace(_ args: [String]) -> String {
 // AeroSpace to OmniWM (and back) while this daemon runs, so which one is
 // asked is decided per use, never cached: the running-app check is an
 // in-process lookup, cheap enough to be the whole detection.
-let omniwmBundleIDs = ["com.barut.OmniWM", "com.jonathan.OmniWMPatched"]
+let omniwmBundleIDs = ["com.barut.OmniWM"]
 
 func omniwmActive() -> Bool {
     omniwmBundleIDs.contains {
@@ -646,8 +646,10 @@ func shell(_ launch: String, _ args: [String]) -> String {
 }
 
 // --- meetings (EventKit publishes database and permission changes) --------
-// EventKit objects become invalid when the store changes. Only these value
-// snapshots cross from the calendar queue to the main-thread UI.
+// Event titles, notes, and attendees stay in Calendar.app. This process only
+// holds in-memory snapshots for today's UI; nothing is written into the repo.
+// Optional calendar-title allowlists live in a gitignored local conf (see
+// config/bar.local.conf.example) — same idea as apps.local.conf.
 struct MeetingEvent: Equatable {
     let title: String
     let startDate: Date
@@ -659,6 +661,34 @@ struct MeetingEvent: Equatable {
 private struct MeetingURLCandidate {
     let url: URL
     let sourcePriority: Int
+}
+
+enum BarLocalConfig {
+    // Exact Calendar.app titles. nil/empty = every editable calendar.
+    static func calendarTitles() -> Set<String>? {
+        let paths = [
+            ProcessInfo.processInfo.environment["OMACOSY_BAR_LOCAL_CONF"],
+            "\(NSHomeDirectory())/.config/omacosy-personal/bar.local.conf",
+        ].compactMap { $0 }.filter { !$0.isEmpty }
+        for path in paths {
+            guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            var titles = Set<String>()
+            for raw in text.split(whereSeparator: \.isNewline) {
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+                guard let eq = line.firstIndex(of: "=") else { continue }
+                let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+                guard key == "CALENDAR_TITLES" else { continue }
+                let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+                for part in value.split(separator: ",") {
+                    let title = part.trimmingCharacters(in: .whitespaces)
+                    if !title.isEmpty { titles.insert(String(title)) }
+                }
+            }
+            if !titles.isEmpty { return titles }
+        }
+        return nil
+    }
 }
 
 final class MeetingController {
@@ -763,9 +793,17 @@ final class MeetingController {
                 return
             }
             // Subscribed read-only calendars are usually holidays or feeds.
-            // The default includes calendars whose events the user can edit.
-            let calendars = self.eventStore.calendars(for: .event)
+            // Default: every editable calendar. Optional CALENDAR_TITLES in the
+            // gitignored bar.local.conf narrows that list without putting
+            // calendar names into git.
+            let editable = self.eventStore.calendars(for: .event)
                 .filter(\.allowsContentModifications)
+            let calendars: [EKCalendar]
+            if let allowed = BarLocalConfig.calendarTitles() {
+                calendars = editable.filter { allowed.contains($0.title) }
+            } else {
+                calendars = editable
+            }
             guard !calendars.isEmpty else {
                 self.publish([], generation: generation, loaded: true)
                 return
@@ -981,15 +1019,66 @@ let aiProviders = [
     AIProvider(id: "claude", name: "Claude", symbol: "✳"),
     AIProvider(id: "cursor", name: "Cursor", symbol: "➤")
 ]
+// Local start-of-day distance; 10+ days use ceiling weeks (10 days → 2w, not 1w).
+enum ResetHorizon: Equatable {
+    case today
+    case tomorrow
+    case days(Int) // 2...9
+    case weeks(Int) // >= 1, only for 10+ days
+
+    init?(from now: Date, to resetsAt: Date, calendar: Calendar = .current) {
+        guard resetsAt > now,
+              let days = calendar.dateComponents(
+                  [.day],
+                  from: calendar.startOfDay(for: now),
+                  to: calendar.startOfDay(for: resetsAt)
+              ).day, days >= 0 else { return nil }
+        switch days {
+        case 0: self = .today
+        case 1: self = .tomorrow
+        case 2...9: self = .days(days)
+        default: self = .weeks(max(1, (days + 6) / 7))
+        }
+    }
+
+    var tag: String {
+        switch self {
+        case .today: return "0"
+        case .tomorrow: return "t"
+        case .days(let n): return "\(n)"
+        case .weeks: return "w"
+        }
+    }
+
+    var phrase: String {
+        switch self {
+        case .today: return "resets today"
+        case .tomorrow: return "resets tomorrow"
+        case .days(let n): return "resets in \(n) days"
+        case .weeks(let n): return "resets within \(n) weeks"
+        }
+    }
+}
+
 // CodexBar UsagePaceText calls negative usage-minus-expected delta "in reserve".
 struct AIReserve: Equatable {
     let percent: Int // positive reserve, negative deficit; zero means On pace
     let scope: String
+    let resetsAt: Date? // stored instant; horizon is derived so outage retain still crosses midnight
+    init(percent: Int, scope: String, resetsAt: Date? = nil) {
+        self.percent = percent
+        self.scope = scope
+        self.resetsAt = resetsAt
+    }
     var text: String { percent == 0 ? "0%" : String(format: "%+d%%", percent) }
+    var figure: String { percent == 0 ? "0" : String(format: "%+d", percent) }
     var detail: String {
         percent == 0 ? "\(scope) · On pace" : "\(scope) · \(abs(percent))% in \(percent > 0 ? "reserve" : "deficit")"
     }
     var severity: Int { percent < -6 ? 2 : (percent < 0 ? 1 : 0) }
+    func horizon(now: Date, calendar: Calendar = .current) -> ResetHorizon? {
+        resetsAt.flatMap { ResetHorizon(from: now, to: $0, calendar: calendar) }
+    }
 }
 
 func aiFiniteNumber(_ value: Any?) -> Double? {
@@ -1050,7 +1139,8 @@ func fableReserve(_ window: [String: Any], now: Date, workDays: Int?,
     // Match the GUI's weekly visibility gate and unrounded ±2-point On pace band.
     guard expected >= 3 || actual >= 100 else { return nil }
     let reserve = expected - actual
-    return AIReserve(percent: abs(reserve) <= 2 ? 0 : Int(reserve.rounded()), scope: "Fable weekly")
+    return AIReserve(percent: abs(reserve) <= 2 ? 0 : Int(reserve.rounded()),
+                     scope: "Fable weekly", resetsAt: reset)
 }
 
 func parseAIReserve(_ entry: [String: Any], now: Date, workDays: Int?) -> AIReserve? {
@@ -1072,13 +1162,14 @@ func parseAIReserve(_ entry: [String: Any], now: Date, workDays: Int?) -> AIRese
           let pace = (entry["pace"] as? [String: Any])?[lane] as? [String: Any],
           let delta = aiFiniteNumber(pace["deltaPercent"]), abs(delta) <= 100,
           let stage = pace["stage"] as? String else { return nil }
+    let resetsAt = aiUsageDate((usage[lane] as? [String: Any])?["resetsAt"])
     switch stage {
-    case "onTrack": return AIReserve(percent: 0, scope: scope)
+    case "onTrack": return AIReserve(percent: 0, scope: scope, resetsAt: resetsAt)
     case "slightlyAhead", "ahead", "farAhead": guard delta > 0 else { return nil }
     case "slightlyBehind", "behind", "farBehind": guard delta < 0 else { return nil }
     default: return nil
     }
-    return AIReserve(percent: -Int(delta.rounded()), scope: scope)
+    return AIReserve(percent: -Int(delta.rounded()), scope: scope, resetsAt: resetsAt)
 }
 
 struct AIUsageState: Equatable {
@@ -1095,7 +1186,6 @@ struct AIUsageState: Equatable {
     }
     var reserve: AIReserve? = nil
 }
-let codexUsageURL = URL(string: "http://127.0.0.1:50891/usage")!
 let codexDashboardURL = URL(string: "http://127.0.0.1:50891/")!
 var aiUsage: [String: AIUsageState] = [:]
 var codexRefreshInFlight = false
@@ -1239,8 +1329,10 @@ func updateCodexItem() {
     set("codex") {
         $0.icon = ""
         $0.label = aiProviders.map { provider in
-            let percent = aiUsage[provider.id]?.reserve?.text ?? "—"
-            return "\(provider.name) \(percent)"
+            let reserve = aiUsage[provider.id]?.reserve
+            let figure = reserve?.figure ?? "—"
+            let tag = reserve?.horizon(now: Date())?.tag ?? ""
+            return tag.isEmpty ? "\(provider.name) \(figure)" : "\(provider.name) \(figure) \(tag)"
         }.joined(separator: " | ")
         // Keep all three segments together; retain the bar's collision guard.
         $0.compactLabel = $0.label
@@ -1250,32 +1342,14 @@ func updateCodexItem() {
     }
 }
 
-func updateCodexUsage() {
-    updateCursorUsage()
-    guard !codexRefreshInFlight else { return }
-    codexRefreshInFlight = true
-    updateCodexItem()
-    var request = URLRequest(url: codexUsageURL)
-    request.timeoutInterval = 15
-    URLSession.shared.dataTask(with: request) { data, response, error in
-        let success = error == nil && (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } == true
-        let responseData = success ? data : nil
-        DispatchQueue.main.async {
-            codexRefreshInFlight = false
-            // Retain each provider independently, with cached status and a one-hour expiry.
-            aiUsage = reduceAIUsage(previous: aiUsage, data: responseData, now: Date(), providerIDs: ["codex", "claude"])
-            updateCodexItem()
-            if openPopup == "codex" { refreshPopup() }
-        }
-    }.resume()
-}
-
-// BEGIN CURSOR CLI — also compiled by personal-bar/test-usage.
+// BEGIN CODEXBAR CLI — also compiled by personal-bar/test-usage.
 // Run only off the main queue. Nonblocking reads bound memory and wall time,
 // including a CLI that hangs or leaves stdout open in a child process.
-func cursorCLIUsage(executable: String = "/opt/homebrew/bin/codexbar",
-                    arguments: [String] = ["usage", "--provider", "cursor", "--json"],
-                    timeout: TimeInterval = 30, outputLimit: Int = 1_048_576) -> Data? {
+// One `codexbar usage --json` call covers Codex, Claude, and Cursor so the pill
+// tracks the same live CLI the CodexBar app uses, not a stale local HTTP serve.
+func codexbarCLIUsage(executable: String = "/opt/homebrew/bin/codexbar",
+                      arguments: [String] = ["usage", "--json"],
+                      timeout: TimeInterval = 30, outputLimit: Int = 1_048_576) -> Data? {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
     process.arguments = arguments
@@ -1308,17 +1382,18 @@ func cursorCLIUsage(executable: String = "/opt/homebrew/bin/codexbar",
     if process.isRunning { kill(process.processIdentifier, SIGKILL) }
     return nil
 }
-// END CURSOR CLI
+// END CODEXBAR CLI
 
-var cursorRefreshInFlight = false
-func updateCursorUsage() {
-    guard !cursorRefreshInFlight else { return }
-    cursorRefreshInFlight = true
+func updateCodexUsage() {
+    guard !codexRefreshInFlight else { return }
+    codexRefreshInFlight = true
+    updateCodexItem()
     DispatchQueue.global(qos: .utility).async {
-        let data = cursorCLIUsage()
+        let data = codexbarCLIUsage()
         DispatchQueue.main.async {
-            cursorRefreshInFlight = false
-            aiUsage = reduceAIUsage(previous: aiUsage, data: data, now: Date(), providerIDs: ["cursor"])
+            codexRefreshInFlight = false
+            // Retain each provider independently, with cached status and a one-hour expiry.
+            aiUsage = reduceAIUsage(previous: aiUsage, data: data, now: Date())
             updateCodexItem()
             if openPopup == "codex" { refreshPopup() }
         }
@@ -2371,7 +2446,8 @@ func codexRows() -> [PopupRow] {
         rows.append(PopupRow(text: "\(provider.symbol)  \(provider.name)", hero: true))
         rows.append(PopupRow(text: aiUsage[provider.id]?.detail ?? "Loading…", dim: true))
         if let reserve = aiUsage[provider.id]?.reserve {
-            rows.append(PopupRow(text: reserve.detail, highlight: true))
+            let text = reserve.horizon(now: Date()).map { "\(reserve.detail) · \($0.phrase)" } ?? reserve.detail
+            rows.append(PopupRow(text: text, highlight: true))
         }
         if provider.id == "claude" {
             rows.append(PopupRow(text: "Fable scope only; general limits still apply", dim: true))
@@ -3157,6 +3233,10 @@ func drawText(_ s: String, _ font: NSFont, _ color: NSColor, leftAt x: CGFloat, 
     drawLine(s, font, color, baseline: CGPoint(x: x, y: midY - font.capHeight / 2))
 }
 
+func drawText(_ s: String, _ font: NSFont, _ color: NSColor, rightAt x: CGFloat, midY: CGFloat) {
+    drawLine(s, font, color, baseline: CGPoint(x: x - advance(s, font), y: midY - font.capHeight / 2))
+}
+
 // Icons come from the running app and are cached by name: a redraw must
 // not walk the process list.
 var iconCache: [String: NSImage] = [:]
@@ -3410,35 +3490,33 @@ final class BarView: NSView {
         }
 
         // right cluster: laid out from the right edge inwards, so a pill
-        // changing width never shifts the ones outside it
+        // changing width never shifts the ones outside it. Codex is placed
+        // last into a reserved slot — other pills compact/yield first so the
+        // AI pill cannot disappear when the left cluster grows.
         removeAllToolTips()
         let builtinPanel = CGDisplayIsBuiltin(screenID(surface.screen)) != 0
+        let labelFont = chipFont
+        let codexItem = rightItems["codex"]
+        let showCodex = codexItem?.drawing == true
+            && !(codexItem?.icon.isEmpty == true && codexItem?.label.isEmpty == true)
+        let codexWidth: CGFloat = showCodex ? 218 : 0
+        let codexReserve: CGFloat = showCodex ? codexWidth + gap : 0
         var cursor = bounds.maxX - padLeft
-        for name in rightOrder.reversed() {
+        for name in rightOrder.reversed() where name != "codex" {
             if meetingLeftOfNotch && name == "meeting" { continue }
             if builtinPanel && builtinOmitRight.contains(name) { continue }
             guard var item = rightItems[name], item.drawing,
                   !(item.icon.isEmpty && item.label.isEmpty) else { continue }
-            let labelFont = chipFont
 
             func measuredWidth(_ candidate: BarItem) -> CGFloat {
                 rightItemWidth(name, candidate, iconFont: iconFont, labelFont: labelFont)
             }
 
-            // Responsive items use their compact label before colliding with
-            // media, the left cluster, or the notch on this display.
-            // Codex is reserved: other pills compact/yield before it disappears.
-            if name != "codex", let compact = item.compactLabel {
-                let reserve: CGFloat = (rightItems["codex"]?.drawing == true
-                    && !(rightItems["codex"]?.icon.isEmpty == true && rightItems["codex"]?.label.isEmpty == true))
-                    ? 218 + gap : 0
-                let budget = cursor - occupiedThrough - gap - reserve
-                if measuredWidth(item) > budget { item.label = compact }
-                if measuredWidth(item) > budget { continue }
-            } else if name == "codex" {
-                let budget = cursor - occupiedThrough - gap
-                if measuredWidth(item) > budget { continue }
+            let budget = cursor - occupiedThrough - gap - codexReserve
+            if let compact = item.compactLabel, measuredWidth(item) > budget {
+                item.label = compact
             }
+            if measuredWidth(item) > budget { continue }
 
             let iconColor = item.iconColor ?? palette.label
             let labelColor = item.labelColor ?? palette.label
@@ -3453,45 +3531,54 @@ final class BarView: NSView {
             let iconInk = hasIcon ? inkBox(item.icon, iconFont).width : 0
             let labelAdv = hasLabel ? advance(item.label, labelFont) : 0
             let innerGap: CGFloat = hasIcon && hasLabel ? 7 : 0
-            let width: CGFloat = name == "codex" ? 218 : 10 + iconInk + innerGap + labelAdv + 10
+            let width = 10 + iconInk + innerGap + labelAdv + 10
             let pill = NSRect(x: cursor - width, y: (barHeight - pillHeight) / 2,
                               width: width, height: pillHeight)
             palette.itemBG.setFill()
             NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
-            if name == "codex" {
-                for (index, provider) in aiProviders.enumerated() {
-                    let x = pill.minX + 10 + CGFloat(index) * 68
-                    let reserve = aiUsage[provider.id]?.reserve
-                    let stale = aiUsage[provider.id]?.stale == true
-                    let color = stale ? palette.label.withAlphaComponent(0.6) : reserve.map { $0.severity == 2 ? palette.red : ($0.severity == 1 ? palette.yellow : palette.green) }
-                        ?? palette.label.withAlphaComponent(0.45)
-                    drawText(provider.symbol, NSFont.systemFont(ofSize: 15, weight: .semibold), color,
-                             leftAt: x, midY: pill.midY)
-                    if stale {
-                        color.setFill()
-                        NSBezierPath(ovalIn: NSRect(x: x + 14, y: pill.midY + 5, width: 3, height: 3)).fill()
-                    }
-                    let text = reserve?.text ?? "—"
-                    drawText(text, NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), color,
-                             leftAt: x + 21, midY: pill.midY)
-                    if index < 2 {
-                        drawText("|", labelFont, palette.label.withAlphaComponent(0.2),
-                                 leftAt: x + 61, midY: pill.midY)
-                    }
-                }
-                addToolTip(pill, owner: self, userData: nil)
-            }
-            if hasIcon && name != "codex" {
+            if hasIcon {
                 drawIcon(item.icon, iconFont, iconColor,
                          centeredIn: NSRect(x: pill.minX + 10, y: pill.minY,
                                             width: iconInk, height: pill.height))
             }
-            if hasLabel && name != "codex" {
+            if hasLabel {
                 drawText(item.label, labelFont, labelColor,
                          leftAt: pill.minX + 10 + iconInk + innerGap, midY: pill.midY)
             }
             itemRects.append((name, NSRect(x: pill.minX, y: 0, width: width, height: barHeight)))
             cursor = pill.minX - gap
+        }
+        if showCodex {
+            let width = codexWidth
+            let pill = NSRect(x: cursor - width, y: (barHeight - pillHeight) / 2,
+                              width: width, height: pillHeight)
+            palette.itemBG.setFill()
+            NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
+            for (index, provider) in aiProviders.enumerated() {
+                let x = pill.minX + 10 + CGFloat(index) * 68
+                let reserve = aiUsage[provider.id]?.reserve
+                let stale = aiUsage[provider.id]?.stale == true
+                let color = stale ? palette.label.withAlphaComponent(0.6) : reserve.map { $0.severity == 2 ? palette.red : ($0.severity == 1 ? palette.yellow : palette.green) }
+                    ?? palette.label.withAlphaComponent(0.45)
+                drawText(provider.symbol, NSFont.systemFont(ofSize: 15, weight: .semibold), color,
+                         leftAt: x, midY: pill.midY)
+                if stale {
+                    color.setFill()
+                    NSBezierPath(ovalIn: NSRect(x: x + 14, y: pill.midY + 5, width: 3, height: 3)).fill()
+                }
+                drawText(reserve?.figure ?? "—", NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), color,
+                         leftAt: x + 21, midY: pill.midY)
+                if let tag = reserve?.horizon(now: Date())?.tag {
+                    drawText(tag, NSFont.monospacedDigitSystemFont(ofSize: 8.5, weight: .medium),
+                             color.withAlphaComponent(0.7), rightAt: x + 59, midY: pill.midY)
+                }
+                if index < 2 {
+                    drawText("|", labelFont, palette.label.withAlphaComponent(0.2),
+                             leftAt: x + 61, midY: pill.midY)
+                }
+            }
+            addToolTip(pill, owner: self, userData: nil)
+            itemRects.append(("codex", NSRect(x: pill.minX, y: 0, width: width, height: barHeight)))
         }
     }
 
@@ -3499,8 +3586,11 @@ final class BarView: NSView {
     @objc func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag,
                        point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
         aiProviders.map { provider in
-            let value = aiUsage[provider.id]?.reserve?.detail
-                ?? aiUsage[provider.id]?.status ?? "Loading…"
+            let reserve = aiUsage[provider.id]?.reserve
+            var value = reserve?.detail ?? aiUsage[provider.id]?.status ?? "Loading…"
+            if let phrase = reserve?.horizon(now: Date())?.phrase {
+                value += " · \(phrase)"
+            }
             return "\(provider.symbol) \(provider.name): \(value) · \(aiUsage[provider.id]?.detail ?? "Loading…")"
         }.joined(separator: "\n") + "\nClick for limits, resets and connection settings."
     }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build only Jonathan's personal bar into this checkout.
+# Build the personal bar into this checkout.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

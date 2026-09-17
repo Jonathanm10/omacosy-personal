@@ -15,6 +15,10 @@
 #
 # Super = Caps Lock = command+control+option (the existing remap), so
 # the chords arrive as ordinary modifier combos.
+#
+# Super+scroll for stacked windows is NOT here — Karabiner cannot take
+# scroll as a from-event. That lives in omacosy-gesture
+# (super_scroll_stack → Left Option+scroll on this machine).
 set -euo pipefail
 
 KARABINER="$HOME/.config/karabiner/karabiner.json"

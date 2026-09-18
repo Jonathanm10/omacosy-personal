@@ -52,7 +52,6 @@ fi
 # Homebrew >=6 refuses third-party taps until explicitly trusted
 brew trust nikitabobko/tap 2>/dev/null || true
 brew trust felixkratz/formulae 2>/dev/null || true
-brew trust BarutSRB/tap 2>/dev/null || true
 
 log "Installing packages (brew bundle)"
 PRE_FORMULAE="$(brew list --formula 2>/dev/null | sort)"
@@ -164,7 +163,7 @@ if [ -f "$HOME/.config/karabiner/karabiner.json" ] \
   mark "had-karabiner-config"
 fi
 cp "$REPO_DIR/config/karabiner/karabiner.json" "$HOME/.config/karabiner/karabiner.json"
-launchctl kickstart -k "gui/$(id -u)/org.pqrs.service.agent.karabiner_console_user_server" 2>/dev/null || true
+launchctl kickstart -k "gui/$(id -u)/org.pqrs.service.agent.Karabiner-Console-User-Server" 2>/dev/null || true
 # Karabiner's Menu and NotificationWindow helpers are disabled the
 # SUPPORTED way in karabiner.json (global.show_in_menu_bar and
 # global.enable_notification_window, both false) — the bootout below
@@ -274,7 +273,7 @@ cp "$REPO_DIR/config/borders.conf" "$HOME/.config/omacosy/borders.conf"
 # app choices, RESOLVED (apps.local.conf already applied), for the same
 # reason: the bar's activity pill launches $TERMINAL and cannot read the
 # repo from a launchd agent when the clone is TCC-protected
-printf 'TERMINAL=%s\nBROWSER=%s\nMUSIC=%s\nMESSENGER=%s\n' \
+printf 'TERMINAL="%s"\nBROWSER="%s"\nMUSIC="%s"\nMESSENGER="%s"\n' \
   "$TERMINAL" "$BROWSER" "$MUSIC" "$MESSENGER" > "$HOME/.config/omacosy/apps.conf"
 
 cat > "$HOME/Library/LaunchAgents/com.omacosy.borders.plist" <<PLIST
@@ -488,7 +487,7 @@ sleep 1
 # the settings window, and it costs ~92MB resident to leave open. Launch
 # it only when the service is not already up — i.e. a first run, where it
 # is needed to approve the driver extension.
-if launchctl list 2>/dev/null | grep -q org.pqrs.service.agent.karabiner_console_user_server; then
+if launchctl list 2>/dev/null | grep -qiE 'karabiner[-_]console[-_]user[-_]server'; then
   log "Karabiner already running (Caps Lock -> Super)"
 else
   log "Starting Karabiner-Elements (approve its driver extension, then quit the app)"

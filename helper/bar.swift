@@ -959,16 +959,17 @@ final class MeetingController {
             return
         }
         displayedEvent = event
-        let untilStart = event.startDate.timeIntervalSince(now)
-        let nearStart = untilStart <= 10 * 60
         let timing = timingText(for: event, at: now)
         let title = event.title.count <= 42 ? event.title : String(event.title.prefix(41)) + "…"
         set("meeting") {
             $0.icon = "󰤙"
             $0.label = "\(title) · \(timing)"
             $0.compactLabel = timing
-            $0.iconColor = nearStart ? palette.accent : nil
-            $0.labelColor = nearStart ? palette.accent : nil
+            // Near-start used to tint with accent; on osaka-jade that is
+            // green-on-green and unreadable. Keep the same label ink as the
+            // rest of the right cluster (battery/wifi/clock).
+            $0.iconColor = nil
+            $0.labelColor = nil
             $0.drawing = true
         }
     }
@@ -3558,8 +3559,11 @@ final class BarView: NSView {
                 let x = pill.minX + 10 + CGFloat(index) * 68
                 let reserve = aiUsage[provider.id]?.reserve
                 let stale = aiUsage[provider.id]?.stale == true
-                let color = stale ? palette.label.withAlphaComponent(0.6) : reserve.map { $0.severity == 2 ? palette.red : ($0.severity == 1 ? palette.yellow : palette.green) }
-                    ?? palette.label.withAlphaComponent(0.45)
+                // Healthy/on-pace used palette.green; on osaka-jade that sinks
+                // into ITEM_BG. Match other pills' label ink; keep yellow/red
+                // only for deficit. Unknown used to be label@0.45 — same mud.
+                let color = stale ? palette.label.withAlphaComponent(0.75) : reserve.map { $0.severity == 2 ? palette.red : ($0.severity == 1 ? palette.yellow : palette.label) }
+                    ?? palette.label
                 drawText(provider.symbol, NSFont.systemFont(ofSize: 15, weight: .semibold), color,
                          leftAt: x, midY: pill.midY)
                 if stale {

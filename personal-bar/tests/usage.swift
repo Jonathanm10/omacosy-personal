@@ -188,12 +188,16 @@ assert(fable(10, reset: "invalid") == nil)
 assert(fable(10, reset: "2026-09-08T12:00:00Z") == nil)
 assert(fable(10, reset: "2026-09-16T12:00:00Z") == nil)
 assert(fable(10, minutes: 300) == nil)
-assert(fable(10, reset: "2026-09-15T11:00:00Z") == nil) // Early cycle hidden below 3% expected.
+assert(fable(0, reset: "2026-09-15T12:00:00Z")?.percent == 0)
+assert(fable(0.5, reset: "2026-09-15T11:00:00Z")?.percent == 0)
+assert(fable(4, reset: "2026-09-15T11:00:00Z")?.percent == -3)
+assert(fable(10, reset: "2026-09-15T11:00:00Z")?.percent == -9, "Early Fable usage stays visible")
 assert(fable(100, reset: "2026-09-15T11:00:00Z")?.percent == -99) // GUI shows exhausted weekly pace.
 assert(fable(0, days: 5)?.percent == 30) // Mon + half Tue / five workdays.
 assert(fable(0, days: 2)?.percent == 75)
 assert(fable(0, days: 7)?.percent == 50)
 assert(fable(0, days: 1)?.percent == 50) // Source ignores values outside 2..<7.
+assert(fable(0, reset: "2026-09-13T00:00:00Z", at: aiUsageDate("2026-09-06T12:00:00Z")!, days: 5)?.percent == 0)
 assert(fable(48)?.resetsAt == aiUsageDate("2026-09-12T00:00:00Z"))
 assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-08T18:00:00Z")!, calendar: utc) == .today)
 assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-08T18:00:00Z")!, calendar: utc)?.tag == "0")
@@ -217,6 +221,30 @@ assert(reserves["claude"]?.reserve?.horizon(now: now, calendar: utc)?.tag == "4"
 assert(reserveOutage["claude"]?.reserve?.resetsAt == reserves["claude"]?.reserve?.resetsAt)
 assert(reserveOutage["claude"]?.reserve?.horizon(now: now.addingTimeInterval(420), calendar: utc) == .days(4))
 assert(reserveOutage["claude"]?.reserve?.horizon(now: now.addingTimeInterval(3 * 24 * 3600), calendar: utc) == .tomorrow)
+let fableBeforeReset = Data("""
+[{"provider":"claude","usage":{"updatedAt":"2026-09-18T13:59:00Z","primary":{"usedPercent":4},"extraRateWindows":[{"id":"claude-weekly-scoped-fable","window":{"usedPercent":4,"windowMinutes":10080,"resetsAt":"2026-09-18T14:00:00Z"}}]}}]
+""".utf8)
+let beforeResetNow = aiUsageDate("2026-09-18T13:59:00Z")!
+let staleFable = reduceAIUsage(previous: reduceAIUsage(previous: [:], data: fableBeforeReset, now: beforeResetNow),
+                                data: nil, now: beforeResetNow.addingTimeInterval(60))
+assert(staleFable["claude"]?.stale == true)
+assert(staleFable["claude"]?.reserve != nil)
+let fableAfterReset = Data("""
+[{"provider":"claude","usage":{"updatedAt":"2026-09-18T14:01:00Z","primary":{"usedPercent":4},"extraRateWindows":[{"id":"claude-weekly-scoped-fable","window":{"usedPercent":4,"windowMinutes":10080,"resetsAt":"2026-09-25T14:00:00Z"}}]}}]
+""".utf8)
+let afterResetNow = aiUsageDate("2026-09-18T14:01:00Z")!
+let resetFable = reduceAIUsage(previous: staleFable, data: fableAfterReset, now: afterResetNow)
+assert(resetFable["claude"]?.stale == false)
+assert(resetFable["claude"]?.reserve?.percent == -4)
+assert(resetFable["claude"]?.reserve?.resetsAt == aiUsageDate("2026-09-25T14:00:00Z"))
+assert(resetFable["claude"]?.reserve?.horizon(now: afterResetNow, calendar: utc) == .days(7), "Fresh Fable reset stays visible")
+let absentFable = Data("""
+[{"provider":"claude","usage":{"updatedAt":"2026-09-18T14:01:00Z","primary":{"usedPercent":4},"extraRateWindows":[]}}]
+""".utf8)
+let invalidFable = Data(String(data: fableAfterReset, encoding: .utf8)!
+    .replacingOccurrences(of: "\"windowMinutes\":10080", with: "\"windowMinutes\":300").utf8)
+assert(parseAIUsage(absentFable, now: afterResetNow)?["claude"]?.reserve == nil)
+assert(parseAIUsage(invalidFable, now: afterResetNow)?["claude"]?.reserve == nil)
 let scopedResets = parseAIUsage(Data("""
 [{"provider":"codex","pace":{"secondary":{"deltaPercent":5,"stage":"ahead"}},"usage":{"updatedAt":"2026-09-08T12:00:00Z","secondary":{"usedPercent":10,"resetsAt":"2026-09-09T18:00:00Z"}}},
  {"provider":"cursor","pace":{"tertiary":{"deltaPercent":-8,"stage":"behind"}},"usage":{"updatedAt":"2026-09-08T12:00:00Z","tertiary":{"usedPercent":20,"resetsAt":"2026-09-10T08:00:00Z"}}}]

@@ -1137,8 +1137,6 @@ func fableReserve(_ window: [String: Any], now: Date, workDays: Int?,
         guard total > 0 else { return nil }
         expected = min(100, max(0, consumed / total * 100))
     }
-    // Match the GUI's weekly visibility gate and unrounded ±2-point On pace band.
-    guard expected >= 3 || actual >= 100 else { return nil }
     let reserve = expected - actual
     return AIReserve(percent: abs(reserve) <= 2 ? 0 : Int(reserve.rounded()),
                      scope: "Fable weekly", resetsAt: reset)

@@ -47,9 +47,9 @@ is rounded as CodexBar does. Fable uses the current local calendar and the same
 `weeklyProgressWorkDays` key, checking `com.steipete.codexbar` then
 `com.steipete.codexbar.debug`. Unset (as verified locally) means seven-day linear
 progress. Values 2–6 count Monday through that ISO weekday, slicing at local day
-boundaries (including DST); other values use continuous progress. Fable follows
-the GUI's early-window gate (expected usage at least 3%, unless exhausted), and
-invalid/missing reset, duration, scoped window, or supplied pace shows unknown.
+boundaries (including DST); other values use continuous progress. Every valid
+Fable cycle is visible immediately, including zero progress. Invalid/missing
+reset, duration, scoped window, or supplied pace shows unknown.
 The popup retains every raw usage limit and reset, explicitly labelled **used**.
 The three fixed-width segments stay together when the bar has room.
 On the built-in MacBook display, weather / Wi-Fi / Bluetooth / brightness

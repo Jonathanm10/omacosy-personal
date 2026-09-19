@@ -33,23 +33,30 @@ scoped lane has `resetsAt`: `0` today, `t` tomorrow, `2`…`9` days, `w` for 10+
 days (ceiling weeks). Missing reset keeps the figure and omits the tag. Hover and
 the popup still use the `%` wording and the exact reset time, and name the scope:
 
-- **Codex weekly:** CLI `pace.secondary`, not model-specific windows
-  (including the unrelated `gpt-reserve` quota).
+- **Codex weekly:** CLI `pace.secondary`, with a local calculation from the exact
+  weekly `usage.secondary` window when pace is omitted. Model-specific windows,
+  including the unrelated `gpt-reserve` quota, never substitute for this lane.
 - **Claude Fable weekly:** exact `claude-weekly-scoped-fable` window. The bar computes
   CodexBar's weekly pace formula from its reset, 10,080-minute duration, and raw
   usage. General Claude limits remain visible in the popup and can still constrain
   Fable; they do not replace the requested scoped reserve.
-- **Cursor Third Party monthly:** CLI `pace.tertiary`, with its
-  matching tertiary usage window. Neither Cursor models nor Grok Bot is substituted.
+- **Cursor Third Party monthly:** CLI `pace.tertiary`, with a local calculation
+  from the matching `usage.tertiary` window when pace is omitted. The calculation
+  uses the supplied billing-cycle duration. Neither Cursor models nor Grok Bot
+  is substituted.
 
 The supplied Codex/Cursor pace stage controls On pace; otherwise the signed delta
-is rounded as CodexBar does. Fable uses the current local calendar and the same
-`weeklyProgressWorkDays` key, checking `com.steipete.codexbar` then
+is rounded as CodexBar does. Locally calculated weekly reserves use the current
+local calendar and the `weeklyProgressWorkDays` key, checking `com.steipete.codexbar` then
 `com.steipete.codexbar.debug`. Unset (as verified locally) means seven-day linear
 progress. Values 2–6 count Monday through that ISO weekday, slicing at local day
-boundaries (including DST); other values use continuous progress. Every valid
-Fable cycle is visible immediately, including zero progress. Invalid/missing
-reset, duration, scoped window, or supplied pace shows unknown.
+boundaries (including DST); other values use continuous progress. Monthly
+calculations always use continuous progress. The shared calculation keeps valid
+cycles visible from zero progress, including after rollover. CodexBar can omit
+pace early in a cycle or when quota is exhausted, even when usage data is valid.
+Missing or null pace uses the local calculation. Malformed supplied pace remains
+unknown. The local calculation requires a valid scoped window, reset, and
+duration; it never substitutes zero for missing data.
 The popup retains every raw usage limit and reset, explicitly labelled **used**.
 The three fixed-width segments stay together when the bar has room.
 On the built-in MacBook display, weather / Wi-Fi / Bluetooth / brightness
@@ -71,8 +78,10 @@ Verified against CodexBar source commit
   `extraRateWindowPaceDetail` applies weekly pace to Claude scoped weekly windows.
 - [`CLIRenderer.swift`](https://github.com/steipete/CodexBar/blob/08ef7710ff548cdd6b297db58cac6c42e47c19f6/Sources/CodexBarCLI/CLIRenderer.swift)
   `pacePayload` exports rounded delta plus stage; its `PaceComputation` comment
-  explicitly says CLI Codex pace omits the GUI's historical refinement. We use the
-  service/CLI's supplied pace, not a claim of full GUI historical-forecast parity.
+  explicitly says CLI Codex pace omits the GUI's historical refinement. The CLI
+  suppresses pace below 3% expected progress and when quota is exhausted. The bar
+  prefers supplied pace and computes the same baseline when pace is omitted.
+  This does not promise full GUI historical-forecast parity.
   [`CLIHelpers.swift`](https://github.com/steipete/CodexBar/blob/08ef7710ff548cdd6b297db58cac6c42e47c19f6/Sources/CodexBarCLI/CLIHelpers.swift)
   establishes the GUI preference key/domain order (the bar does not inherit the
   CLI process's own standard-defaults fallback).

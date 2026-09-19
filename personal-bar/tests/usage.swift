@@ -134,6 +134,83 @@ if CommandLine.arguments.contains("--live") || CommandLine.arguments.contains("-
     }
 }
 
+func cycleFixture(provider: String, lane: String, window: String, pace: String? = nil,
+                  updatedAt: String = "2026-09-08T12:00:00Z") -> Data {
+    let paceJSON = pace.map { ",\"pace\":{\"\(lane)\":\($0)}" } ?? ""
+    return Data("[{\"provider\":\"\(provider)\"\(paceJSON),\"usage\":{\"updatedAt\":\"\(updatedAt)\",\"\(lane)\":\(window)}}]".utf8)
+}
+
+let freshCodexCycle = parseAIUsage(cycleFixture(
+    provider: "codex", lane: "secondary",
+    window: "{\"usedPercent\":0,\"windowMinutes\":10080,\"resetsAt\":\"2026-09-15T12:00:00Z\"}"
+), now: now, workDays: nil)!
+guard freshCodexCycle["codex"]?.reserve?.percent == 0 else {
+    print("FAIL: fresh Codex weekly reset snapshot has no reserve")
+    exit(1)
+}
+let freshCursorCycle = parseAIUsage(cycleFixture(
+    provider: "cursor", lane: "tertiary",
+    window: "{\"usedPercent\":0,\"windowMinutes\":40320,\"resetsAt\":\"2026-10-06T12:00:00Z\"}"
+), now: now, workDays: 5)!
+assert(freshCursorCycle["cursor"]?.reserve?.percent == 0)
+let nullPaceContainer = Data("""
+[{"provider":"codex","pace":null,"usage":{"updatedAt":"2026-09-08T12:00:00Z","secondary":{"usedPercent":0,"windowMinutes":10080,"resetsAt":"2026-09-15T12:00:00Z"}}}]
+""".utf8)
+assert(parseAIUsage(nullPaceContainer, now: now, workDays: nil)?["codex"]?.reserve?.percent == 0)
+assert(parseAIUsage(cycleFixture(
+    provider: "cursor", lane: "tertiary",
+    window: "{\"usedPercent\":0,\"windowMinutes\":43200,\"resetsAt\":\"2026-10-08T12:00:00Z\"}",
+    pace: "null"
+), now: now, workDays: nil)?["cursor"]?.reserve?.percent == 0)
+let omittedPaceLane = Data("""
+[{"provider":"cursor","pace":{},"usage":{"updatedAt":"2026-09-08T12:00:00Z","tertiary":{"usedPercent":0,"windowMinutes":43200,"resetsAt":"2026-10-08T12:00:00Z"}}}]
+""".utf8)
+assert(parseAIUsage(omittedPaceLane, now: now, workDays: nil)?["cursor"]?.reserve?.percent == 0)
+assert(parseAIUsage(cycleFixture(
+    provider: "codex", lane: "secondary",
+    window: "{\"usedPercent\":0}",
+    pace: "{\"deltaPercent\":16,\"stage\":\"farAhead\"}"
+), now: now, workDays: nil)?["codex"]?.reserve?.percent == -16)
+for (provider, lane, window) in [
+    ("codex", "secondary", "{\"usedPercent\":0,\"windowMinutes\":300,\"resetsAt\":\"2026-09-15T12:00:00Z\"}"),
+    ("cursor", "tertiary", "{\"usedPercent\":0,\"windowMinutes\":0,\"resetsAt\":\"2026-10-08T12:00:00Z\"}"),
+    ("cursor", "tertiary", "{\"usedPercent\":0,\"windowMinutes\":43200,\"resetsAt\":\"2026-09-08T12:00:00Z\"}")
+] {
+    assert(parseAIUsage(cycleFixture(provider: provider, lane: lane, window: window), now: now, workDays: nil)?[provider]?.reserve == nil)
+}
+for malformedPace in ["false", "{}"] {
+    assert(parseAIUsage(cycleFixture(
+        provider: "codex", lane: "secondary",
+        window: "{\"usedPercent\":0,\"windowMinutes\":10080,\"resetsAt\":\"2026-09-15T12:00:00Z\"}",
+        pace: malformedPace
+    ), now: now, workDays: nil)?["codex"]?.reserve == nil)
+}
+let codexBeforeReset = aiUsageDate("2026-09-08T11:59:00Z")!
+let codexBefore = reduceAIUsage(previous: [:], data: cycleFixture(
+    provider: "codex", lane: "secondary",
+    window: "{\"usedPercent\":100,\"windowMinutes\":10080,\"resetsAt\":\"2026-09-08T12:00:00Z\"}",
+    updatedAt: "2026-09-08T11:59:00Z"
+), now: codexBeforeReset)
+let codexAfterReset = reduceAIUsage(previous: codexBefore, data: cycleFixture(
+    provider: "codex", lane: "secondary",
+    window: "{\"usedPercent\":4,\"windowMinutes\":10080,\"resetsAt\":\"2026-09-15T12:00:00Z\"}",
+    updatedAt: "2026-09-08T12:01:00Z"
+), now: aiUsageDate("2026-09-08T12:01:00Z")!)
+assert(codexAfterReset["codex"]?.reserve?.percent == -4)
+assert(codexAfterReset["codex"]?.stale == false)
+let cycleDates = ISO8601DateFormatter()
+for days in [28, 29, 30, 31] {
+    let reset = now.addingTimeInterval(Double(days * 24 * 60 * 60))
+    let midpoint = now.addingTimeInterval(Double(days * 12 * 60 * 60))
+    let cursorCycle = parseAIUsage(cycleFixture(
+        provider: "cursor", lane: "tertiary",
+        window: "{\"usedPercent\":10,\"windowMinutes\":\(days * 1440),\"resetsAt\":\"\(cycleDates.string(from: reset))\"}",
+        updatedAt: cycleDates.string(from: midpoint)
+    ), now: midpoint, workDays: 5)!
+    assert(cursorCycle["cursor"]?.reserve?.percent == 40)
+}
+print("Cycle fallback passed: no pace, precedence, invalid cycles, rollover, monthly durations")
+
 // Reserve checks use the real parser without adding synthetic fields to live payloads.
 let reserveData = Data("""
 [{"provider":"codex","pace":{"secondary":{"deltaPercent":16,"stage":"farAhead"}},"usage":{"updatedAt":"2026-09-08T12:00:00Z","primary":{"usedPercent":99},"secondary":{"usedPercent":23},"extraRateWindows":[{"id":"codex-base-model-inference","title":"gpt-reserve","window":{"usedPercent":100}}]}},
@@ -172,33 +249,32 @@ let missingScoped = reduceAIUsage(previous: reserves, data: sequenceData, now: n
 assert(missingScoped["claude"]?.reserve == nil) // New valid snapshot without the scope must not retain its old reserve.
 var utc = Calendar(identifier: .gregorian)
 utc.timeZone = TimeZone(secondsFromGMT: 0)!
-func fable(_ used: Any, reset: String = "2026-09-12T00:00:00Z", minutes: Int = 10080,
-           at: Date = now, days: Int? = nil, calendar: Calendar = utc) -> AIReserve? {
-    fableReserve(["usedPercent": used, "resetsAt": reset, "windowMinutes": minutes],
-                 now: at, workDays: days, calendar: calendar)
+func weekly(_ used: Any, reset: String = "2026-09-12T00:00:00Z", minutes: Int = 10080,
+            at: Date = now, days: Int? = nil, calendar: Calendar = utc) -> AIReserve? {
+    return cycleReserve(["usedPercent": used, "resetsAt": reset, "windowMinutes": minutes],
+                        scope: "Fable weekly", now: at, workDays: days, calendar: calendar)
 }
-assert(fable(48)?.percent == 0)
-assert(fable(52)?.percent == 0)
-assert(fable(47.99)?.percent == 2) // Stage uses raw delta, not rounded delta.
-assert(fable(52.01)?.percent == -2)
-assert(fable(46.5)?.percent == 4)
-assert(fable(53.5)?.percent == -4)
-assert(fable(true) == nil && fable(Double.infinity) == nil)
-assert(fable(10, reset: "invalid") == nil)
-assert(fable(10, reset: "2026-09-08T12:00:00Z") == nil)
-assert(fable(10, reset: "2026-09-16T12:00:00Z") == nil)
-assert(fable(10, minutes: 300) == nil)
-assert(fable(0, reset: "2026-09-15T12:00:00Z")?.percent == 0)
-assert(fable(0.5, reset: "2026-09-15T11:00:00Z")?.percent == 0)
-assert(fable(4, reset: "2026-09-15T11:00:00Z")?.percent == -3)
-assert(fable(10, reset: "2026-09-15T11:00:00Z")?.percent == -9, "Early Fable usage stays visible")
-assert(fable(100, reset: "2026-09-15T11:00:00Z")?.percent == -99) // GUI shows exhausted weekly pace.
-assert(fable(0, days: 5)?.percent == 30) // Mon + half Tue / five workdays.
-assert(fable(0, days: 2)?.percent == 75)
-assert(fable(0, days: 7)?.percent == 50)
-assert(fable(0, days: 1)?.percent == 50) // Source ignores values outside 2..<7.
-assert(fable(0, reset: "2026-09-13T00:00:00Z", at: aiUsageDate("2026-09-06T12:00:00Z")!, days: 5)?.percent == 0)
-assert(fable(48)?.resetsAt == aiUsageDate("2026-09-12T00:00:00Z"))
+assert(weekly(48)?.percent == 0)
+assert(weekly(52)?.percent == 0)
+assert(weekly(47.99)?.percent == 2) // Stage uses raw delta, not rounded delta.
+assert(weekly(52.01)?.percent == -2)
+assert(weekly(46.5)?.percent == 4)
+assert(weekly(53.5)?.percent == -4)
+assert(weekly(true) == nil && weekly(Double.infinity) == nil)
+assert(weekly(10, reset: "invalid") == nil)
+assert(weekly(10, reset: "2026-09-08T12:00:00Z") == nil)
+assert(weekly(10, reset: "2026-09-16T12:00:00Z") == nil)
+assert(weekly(0, reset: "2026-09-15T12:00:00Z")?.percent == 0)
+assert(weekly(0.5, reset: "2026-09-15T11:00:00Z")?.percent == 0)
+assert(weekly(4, reset: "2026-09-15T11:00:00Z")?.percent == -3)
+assert(weekly(10, reset: "2026-09-15T11:00:00Z")?.percent == -9, "Early Fable usage stays visible")
+assert(weekly(100, reset: "2026-09-15T11:00:00Z")?.percent == -99) // GUI shows exhausted weekly pace.
+assert(weekly(0, days: 5)?.percent == 30) // Mon + half Tue / five workdays.
+assert(weekly(0, days: 2)?.percent == 75)
+assert(weekly(0, days: 7)?.percent == 50)
+assert(weekly(0, days: 1)?.percent == 50) // Source ignores values outside 2..<7.
+assert(weekly(0, reset: "2026-09-13T00:00:00Z", at: aiUsageDate("2026-09-06T12:00:00Z")!, days: 5)?.percent == 0)
+assert(weekly(48)?.resetsAt == aiUsageDate("2026-09-12T00:00:00Z"))
 assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-08T18:00:00Z")!, calendar: utc) == .today)
 assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-08T18:00:00Z")!, calendar: utc)?.tag == "0")
 assert(ResetHorizon(from: now, to: aiUsageDate("2026-09-08T18:00:00Z")!, calendar: utc)?.phrase == "resets today")
@@ -257,7 +333,7 @@ var zurich = Calendar(identifier: .gregorian)
 zurich.timeZone = TimeZone(identifier: "Europe/Zurich")!
 let dstNow = aiUsageDate("2026-03-30T10:00:00Z")!
 // Fixed seven-day window starts Monday at 01:00 local before DST; end Monday 02:00 after DST.
-assert(fable(0, reset: "2026-03-31T00:00:00Z", at: dstNow, days: 5, calendar: zurich)?.percent == 88)
+assert(weekly(0, reset: "2026-03-31T00:00:00Z", at: dstNow, days: 5, calendar: zurich)?.percent == 88)
 let onPaceData = Data(String(data: reserveData, encoding: .utf8)!
     .replacingOccurrences(of: "\"deltaPercent\":16,\"stage\":\"farAhead\"", with: "\"deltaPercent\":2,\"stage\":\"onTrack\"").utf8)
 assert(parseAIUsage(onPaceData, now: now, workDays: nil)?["codex"]?.reserve?.percent == 0)

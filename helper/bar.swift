@@ -1106,12 +1106,13 @@ func codexBarWeeklyWorkDays() -> Int? {
     return nil // CodexBar's unset default is continuous seven-day progress.
 }
 
-func fableReserve(_ window: [String: Any], now: Date, workDays: Int?,
+func cycleReserve(_ window: [String: Any], scope: String, now: Date, workDays: Int?,
                   calendar: Calendar = .current) -> AIReserve? {
     guard let used = aiFiniteNumber(window["usedPercent"]),
           let reset = aiUsageDate(window["resetsAt"]),
-          aiFiniteNumber(window["windowMinutes"]) == 10080 else { return nil }
-    let duration: TimeInterval = 10080 * 60
+          let minutes = aiFiniteNumber(window["windowMinutes"]), minutes > 0 else { return nil }
+    let duration = minutes * 60
+    guard duration.isFinite else { return nil }
     let remaining = reset.timeIntervalSince(now)
     guard remaining > 0, remaining <= duration else { return nil }
     let elapsed = duration - remaining
@@ -1139,29 +1140,13 @@ func fableReserve(_ window: [String: Any], now: Date, workDays: Int?,
     }
     let reserve = expected - actual
     return AIReserve(percent: abs(reserve) <= 2 ? 0 : Int(reserve.rounded()),
-                     scope: "Fable weekly", resetsAt: reset)
+                     scope: scope, resetsAt: reset)
 }
 
-func parseAIReserve(_ entry: [String: Any], now: Date, workDays: Int?) -> AIReserve? {
-    guard let usage = entry["usage"] as? [String: Any] else { return nil }
-    if entry["provider"] as? String == "claude" {
-        guard let extra = (usage["extraRateWindows"] as? [[String: Any]])?.first(where: {
-            $0["id"] as? String == "claude-weekly-scoped-fable"
-        }), let window = extra["window"] as? [String: Any] else { return nil }
-        return fableReserve(window, now: now, workDays: workDays)
-    }
-    let lane: String
-    let scope: String
-    switch entry["provider"] as? String {
-    case "codex": lane = "secondary"; scope = "Codex weekly"
-    case "cursor": lane = "tertiary"; scope = "Third Party monthly"
-    default: return nil
-    }
-    guard parseCodexWindow(usage[lane], fallbackTitle: lane) != nil,
-          let pace = (entry["pace"] as? [String: Any])?[lane] as? [String: Any],
+func paceReserve(_ pace: Any?, scope: String, resetsAt: Date?) -> AIReserve? {
+    guard let pace = pace as? [String: Any],
           let delta = aiFiniteNumber(pace["deltaPercent"]), abs(delta) <= 100,
           let stage = pace["stage"] as? String else { return nil }
-    let resetsAt = aiUsageDate((usage[lane] as? [String: Any])?["resetsAt"])
     switch stage {
     case "onTrack": return AIReserve(percent: 0, scope: scope, resetsAt: resetsAt)
     case "slightlyAhead", "ahead", "farAhead": guard delta > 0 else { return nil }
@@ -1169,6 +1154,40 @@ func parseAIReserve(_ entry: [String: Any], now: Date, workDays: Int?) -> AIRese
     default: return nil
     }
     return AIReserve(percent: -Int(delta.rounded()), scope: scope, resetsAt: resetsAt)
+}
+
+func parseAIReserve(_ entry: [String: Any], now: Date, workDays: Int?) -> AIReserve? {
+    guard let usage = entry["usage"] as? [String: Any] else { return nil }
+    if entry["provider"] as? String == "claude" {
+        guard let extra = (usage["extraRateWindows"] as? [[String: Any]])?.first(where: {
+            $0["id"] as? String == "claude-weekly-scoped-fable"
+        }), let window = extra["window"] as? [String: Any],
+           aiFiniteNumber(window["windowMinutes"]) == 10080 else { return nil }
+        return cycleReserve(window, scope: "Fable weekly", now: now, workDays: workDays)
+    }
+    let lane: String
+    let scope: String
+    let isWeekly: Bool
+    switch entry["provider"] as? String {
+    case "codex": lane = "secondary"; scope = "Codex weekly"; isWeekly = true
+    case "cursor": lane = "tertiary"; scope = "Third Party monthly"; isWeekly = false
+    default: return nil
+    }
+    guard let window = usage[lane] as? [String: Any],
+          parseCodexWindow(window, fallbackTitle: lane) != nil else { return nil }
+    let resetsAt = aiUsageDate(window["resetsAt"])
+    let lanePace: Any?
+    if let rawPace = entry["pace"], !(rawPace is NSNull) {
+        guard let pace = rawPace as? [String: Any] else { return nil }
+        lanePace = pace[lane]
+    } else {
+        lanePace = nil
+    }
+    if let lanePace, !(lanePace is NSNull) {
+        return paceReserve(lanePace, scope: scope, resetsAt: resetsAt)
+    }
+    guard !isWeekly || aiFiniteNumber(window["windowMinutes"]) == 10080 else { return nil }
+    return cycleReserve(window, scope: scope, now: now, workDays: isWeekly ? workDays : nil)
 }
 
 struct AIUsageState: Equatable {
